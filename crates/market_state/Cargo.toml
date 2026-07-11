@@ -1,0 +1,15 @@
+[package]
+name = "market_state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+domain.workspace = true
+rust_decimal.workspace = true
+dashmap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true

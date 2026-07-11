@@ -1,0 +1,83 @@
+# Crypto Perp Arbitrage Screener — default configuration (Phase 1)
+# All values overridable via env with prefix `ARB__` and `__` as the nesting separator,
+# e.g. ARB__SERVER__BIND=0.0.0.0:9000  (see bin/server config loader).
+
+[server]
+# axum bind address for both REST and the WS hub.
+bind = "127.0.0.1:8080"
+
+[ingest]
+# Which exchanges to connect. Must be a subset of the 8 supported ids.
+exchanges = ["bybit", "okx", "mexc", "bitget", "gate", "coinex", "kucoin", "phemex"]
+# Canonical base assets to screen (quote is `quote` below). Perp only in Phase 1.
+# Keep this list small at first; every symbol is a subscription on every exchange.
+symbols = ["BTC", "ETH", "SOL", "ARB", "OP", "SUI", "APT", "TIA", "SEI", "WLD"]
+quote = "USDT"
+# Book depth levels to request/keep per instrument (spec §13: start 10–25).
+depth_levels = 20
+# A book older than this (by local monotonic recv time) is excluded from spreads.
+staleness_ms = 3000
+
+[ingest.reconnect]
+# Exponential backoff with jitter for exchange WS reconnects.
+initial_backoff_ms = 500
+max_backoff_ms = 30000
+jitter_ms = 400
+
+[transfer]
+# Poll each exchange's public currency/coin-info endpoint for deposit/withdraw status.
+enabled = true
+poll_interval_secs = 300
+# Assets whose transfer status we track (settlement asset for perp margin rebalance).
+assets = ["USDT"]
+
+# ---------------------------------------------------------------------------
+# Default client config — used for the built-in "default client" and as the
+# server-side default for WS subscribers that omit fields.
+# ---------------------------------------------------------------------------
+[default_client]
+exchanges = ["bybit", "okx", "mexc", "bitget", "gate", "coinex", "kucoin", "phemex"]
+quote = "USDT"
+allow_symbols = []           # empty => allow all screened symbols
+deny_symbols = []
+min_24h_quote_volume = "0"   # USDT; raise to drop dead markets
+min_open_interest = "0"      # base units; 0 => disabled
+
+# Spread band — the 2%..20% control.
+min_net_spread_pct = "0.02"
+max_net_spread_pct = "0.20"
+target_notional_q = "2000"   # USDT size the executable VWAP spread is measured against
+min_executable_notional = "500"
+depth_levels_n = 20
+
+# Funding differential (perp, latency-tolerant signal).
+include_funding_diff = true
+min_funding_diff_apr = "0.15"   # 15% annualized
+funding_hold_hours = "8"
+
+# Reality filters (mirage killers).
+# NOTE: In Phase 1 (no exchange keys) transfer status comes only from PUBLIC
+# currency endpoints — available for gate/kucoin/bitget/coinex/phemex but NOT
+# bybit/okx/mexc (those need read-only keys, a later phase). These default to
+# false so the demo client still emits signals for bybit/okx; flip to true once
+# the transfer store is populated for the venues you care about.
+require_transferable = false      # settlement asset deposit+withdraw enabled on both legs
+require_common_network = false    # both legs share >=1 enabled chain for settlement asset
+max_book_age_ms = 3000
+
+# Noise control.
+hysteresis_step_pct = "0.005"     # re-alert only when spread widens 0.5% past prior peak
+min_signal_lifetime_ms = 1500
+cooldown_ms = 2000
+max_signals_per_min = 120
+
+# Per-exchange taker fee fractions (defaults; client may override).
+[default_client.taker_fee]
+bybit = "0.00055"
+okx = "0.0005"
+mexc = "0.0002"
+bitget = "0.0006"
+gate = "0.0005"
+coinex = "0.0005"
+kucoin = "0.0006"
+phemex = "0.0006"

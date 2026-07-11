@@ -1,0 +1,31 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arb-screener"
+path = "src/main.rs"
+
+[dependencies]
+domain.workspace = true
+connectors.workspace = true
+ingest.workspace = true
+market_state.workspace = true
+screener.workspace = true
+transfer_status.workspace = true
+api.workspace = true
+auth.workspace = true
+persistence.workspace = true
+
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+config.workspace = true
+dotenvy.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+anyhow.workspace = true

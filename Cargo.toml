@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/connectors",
+    "crates/ingest",
+    "crates/market_state",
+    "crates/screener",
+    "crates/transfer_status",
+    "crates/api",
+    "crates/auth",
+    "crates/persistence",
+    "bin/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.38", features = ["full"] }
+futures-util = "0.3"
+async-trait = "0.1"
+
+# HTTP / WS
+axum = { version = "0.7", features = ["ws"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Money / numbers
+rust_decimal = { version = "1.35", features = ["serde-with-str"] }
+rust_decimal_macros = "1.35"
+
+# State / concurrency
+dashmap = "6"
+
+# Config
+config = { version = "0.14", default-features = false, features = ["toml"] }
+dotenvy = "0.15"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+
+# Internal crates
+domain = { path = "crates/domain" }
+connectors = { path = "crates/connectors" }
+ingest = { path = "crates/ingest" }
+market_state = { path = "crates/market_state" }
+screener = { path = "crates/screener" }
+transfer_status = { path = "crates/transfer_status" }
+api = { path = "crates/api" }
+auth = { path = "crates/auth" }
+persistence = { path = "crates/persistence" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
