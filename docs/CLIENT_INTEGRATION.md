@@ -24,6 +24,7 @@ endpoints. Everything here is derived from the running server
 | Liveness + instrument count | GET | `/healthz` |
 | Prometheus metrics | GET | `/metrics` |
 | Current best spread per instrument | GET | `/summary` |
+| Traded-instrument catalog (coins × venues) | GET | `/instruments` |
 | Validate a config without subscribing | POST | `/config/validate` |
 
 Local default host: `127.0.0.1:8080` (see `config/default.toml`).
@@ -44,6 +45,19 @@ Server → client (acknowledgement, echoes the *effective* config with all defau
 ```json
 { "type": "subscribed", "config": { "exchanges": ["bybit","okx", ...], "quote": "USDT", ... } }
 ```
+
+Immediately after `subscribed`, the server pushes the **traded-instrument
+catalog** once (which coins have a USDT perp on which venues, ≥2 venues,
+most-covered first):
+```json
+{ "type": "universe", "instruments": [
+  { "base": "BTC", "quote": "USDT", "exchanges": ["bybit","okx","mexc","bitget","gate","coinex","kucoin","phemex"], "coverage": 8 },
+  { "base": "QNT", "quote": "USDT", "exchanges": ["bybit","okx","mexc","gate"], "coverage": 4 }
+] }
+```
+This message can be large (hundreds of rows) and may arrive as multiple WS
+frames — a normal WS client reassembles them automatically. The full catalog
+(including single-venue coins) is also available via `GET /instruments`.
 
 If auth fails or the config is invalid, the server replies with an `error` and
 (for auth) closes:
@@ -74,12 +88,32 @@ non-duplicate signal appears for a screened instrument:
     "short_exchange": "bybit",
     "diff_apr": "0.1832"
   },
+  "dynamics": {
+    "baseline_pct": "0.0031",
+    "stddev_pct": "0.0090",
+    "current_pct": "0.0289",
+    "z_score": "3.41",
+    "sample_count": 120,
+    "episode_ms": 1400
+  },
+  "quality_score": "66.2",
   "ts_ms": 1752230400000
 }
 ```
-`funding` is **omitted** when there is no qualifying funding differential.
+`funding`, `dynamics`, and `quality_score` are **omitted** when unavailable.
 `buy_exchange` is where you buy (lowest ask); `sell_exchange` is where you sell
 (highest bid). `net_pct` is already net of taker fees on both legs.
+
+**Spread dynamics** describe the coin's behavior (shared, computed with default
+fees), and are the key "real vs mirage" signal:
+- `baseline_pct` — median spread over the rolling window. A *tight* baseline
+  (near 0–1%) with a large `current_pct` is the healthy, capturable pattern.
+- `z_score` — how many stddevs the current spread is above its own mean; a high
+  z is a genuine spike, not "it's always wide".
+- `episode_ms` — how long the spread has stayed above the reference threshold. A
+  large value means it's *not* reverting — likely a structural trap.
+- `quality_score` (0–100) — combines tight baseline + strong spike + short
+  episode + broad venue coverage. Sort/alert by this to surface the best coins.
 
 ### 2.3 Keepalive
 
@@ -122,6 +156,11 @@ should render the newest event per instrument and not assume every tick arrives.
 | `require_transferable` | bool | `false` | Settlement asset transferable both legs |
 | `require_common_network` | bool | `false` | Shared enabled chain both legs |
 | `max_book_age_ms` | int | `3000` | Staleness cutoff |
+| `enable_dynamics` | bool | `true` | Master switch for the spread-dynamics filters |
+| `max_baseline_spread_pct` | decimal-str | `"0.01"` | Reject persistently-wide coins (baseline above this) |
+| `min_spike_z` | decimal-str | `"3"` | Require current spread ≥ this many stddevs above its mean |
+| `max_spread_duration_ms` | int | `300000` | Reject spreads that stay wide longer than this |
+| `min_dynamics_samples` | int | `20` | Warmup before dynamics filters apply |
 | `hysteresis_step_pct` | decimal-str | `"0.005"` | Re-alert only if spread widens this much |
 | `min_signal_lifetime_ms` | int | `1500` | Suppress until opportunity persists this long |
 | `cooldown_ms` | int | `2000` | Min gap between emits per instrument |
@@ -144,7 +183,12 @@ without holding a WS open.
 
 - [ ] WS client with auto-reconnect (exp backoff + jitter) and app-level ping.
 - [ ] Send `subscribe` on connect and on every filter change; handle `subscribed`,
-      `event`, `pong`, `error`.
+      `universe`, `event`, `pong`, `error`.
+- [ ] Store the `universe` catalog (or fetch `GET /instruments`) to show which
+      coins trade on which venues; let the user browse/pick from it.
+- [ ] Sort/highlight events by `quality_score`, and show the `dynamics` block
+      (baseline vs current, z-score, episode age) so the user can see *why* a
+      coin is a good arb candidate.
 - [ ] **Decimal-safe parsing** for every price/ratio field (no floats for money).
 - [ ] A config/filters UI mapping 1:1 to `ClientConfig` — the 2–20% band,
       `target_notional_q`, and (later) volume/OI filters are the key knobs.

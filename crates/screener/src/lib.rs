@@ -9,9 +9,9 @@ pub mod hysteresis;
 pub mod rules;
 
 use dashmap::DashMap;
-use domain::{Instrument, Spread, SpreadReason};
+use domain::{Decimal, Instrument, Spread, SpreadReason};
 use hysteresis::{Decision, PeakState};
-use market_state::InstrumentSnapshot;
+use market_state::{InstrumentSnapshot, SpreadStats};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,6 +27,12 @@ pub struct ScreenerEvent {
     pub spread: Spread,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub funding: Option<FundingSignal>,
+    /// Rolling spread statistics (baseline/spike/episode) for the instrument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamics: Option<SpreadStats>,
+    /// 0–100 arb-quality score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_score: Option<Decimal>,
     /// Server wall-clock time of emission (ms since epoch).
     pub ts_ms: i64,
 }
@@ -137,6 +143,8 @@ impl ScreenerEngine {
         Some(ScreenerEvent {
             spread: eval.spread,
             funding: eval.funding,
+            dynamics: eval.stats,
+            quality_score: eval.quality_score,
             ts_ms,
         })
     }
@@ -183,6 +191,8 @@ mod tests {
             exchange: ex,
             book: book(bid, ask),
             funding: None,
+            quote_volume_24h: None,
+            open_interest: None,
             stale: false,
             valid: true,
         }
@@ -195,6 +205,7 @@ mod tests {
                 quote(ExchangeId::Bybit, cheap_ask - dec!(1), cheap_ask), // buy here
                 quote(ExchangeId::Okx, rich_bid, rich_bid + dec!(1)),     // sell here
             ],
+            stats: None,
         }
     }
 

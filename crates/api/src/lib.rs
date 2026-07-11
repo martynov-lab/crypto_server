@@ -13,12 +13,14 @@ use market_state::MarketState;
 use screener::{ClientConfig, TransferOracle};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use universe::UniverseStore;
 
 /// Shared, cheaply-cloneable application state handed to every handler.
 #[derive(Clone)]
 pub struct AppState {
     pub market: Arc<MarketState>,
     pub oracle: Arc<dyn TransferOracle>,
+    pub universe: Arc<UniverseStore>,
     /// Fan-out of "this instrument's market state changed" notifications. WS
     /// sessions subscribe; lag is tolerated (natural coalescing).
     pub events: broadcast::Sender<Instrument>,
@@ -35,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(rest::healthz))
         .route("/metrics", get(rest::metrics))
         .route("/summary", get(rest::summary))
+        .route("/instruments", get(rest::instruments))
         .route("/config/validate", post(rest::validate_config))
         .route("/ws", get(ws::ws_handler))
         .with_state(state)

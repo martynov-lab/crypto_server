@@ -24,7 +24,25 @@ pub struct IngestCfg {
     pub quote: String,
     pub depth_levels: usize,
     pub staleness_ms: u64,
+    #[serde(default)]
+    pub auto_discover: bool,
+    #[serde(default = "default_min_venues")]
+    pub min_venues: usize,
+    #[serde(default = "default_max_symbols")]
+    pub max_symbols: usize,
+    #[serde(default = "default_discovery_interval")]
+    pub discovery_interval_secs: u64,
     pub reconnect: ReconnectCfg,
+}
+
+fn default_min_venues() -> usize {
+    2
+}
+fn default_max_symbols() -> usize {
+    150
+}
+fn default_discovery_interval() -> u64 {
+    900
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,6 +1,7 @@
 //! Connector supervision and update routing.
 
-use domain::{ExchangeConnector, Instrument, MarketUpdate};
+use domain::{ExchangeConnector, ExchangeId, Instrument, MarketUpdate};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -28,19 +29,21 @@ impl Default for IngestParams {
 
 pub struct IngestManager {
     connectors: Vec<Arc<dyn ExchangeConnector>>,
-    symbols: Vec<Instrument>,
+    /// Per-exchange subscription lists — each venue only subscribes to the
+    /// instruments it actually lists, avoiding dead subscriptions.
+    symbols_by_exchange: HashMap<ExchangeId, Vec<Instrument>>,
     params: IngestParams,
 }
 
 impl IngestManager {
     pub fn new(
         connectors: Vec<Arc<dyn ExchangeConnector>>,
-        symbols: Vec<Instrument>,
+        symbols_by_exchange: HashMap<ExchangeId, Vec<Instrument>>,
         params: IngestParams,
     ) -> Self {
         IngestManager {
             connectors,
-            symbols,
+            symbols_by_exchange,
             params,
         }
     }
@@ -53,7 +56,15 @@ impl IngestManager {
         let mut handles = Vec::with_capacity(self.connectors.len());
 
         for connector in self.connectors {
-            let symbols = self.symbols.clone();
+            let symbols = self
+                .symbols_by_exchange
+                .get(&connector.id())
+                .cloned()
+                .unwrap_or_default();
+            if symbols.is_empty() {
+                warn!(exchange = %connector.id(), "no symbols to subscribe; skipping connector");
+                continue;
+            }
             let tx = tx.clone();
             let restart_delay = self.params.restart_delay;
             let id = connector.id();

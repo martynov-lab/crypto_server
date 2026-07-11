@@ -2,28 +2,49 @@
 //! instrument), with staleness-aware read views for the screener.
 
 pub mod aggregate;
+pub mod dynamics;
 
 use dashmap::DashMap;
 use domain::{ExchangeId, FundingInfo, Instrument, MarketUpdate, TopBook};
+use dynamics::{DynamicsConfig, SpreadHistory};
+use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 pub use aggregate::{ExchangeQuote, InstrumentSnapshot};
+pub use dynamics::SpreadStats;
 
 /// Concurrent store of the freshest book and funding per (exchange, instrument).
+/// 24h volume / open interest per (exchange, instrument).
+type TickerEntry = (Option<Decimal>, Option<Decimal>);
+
 pub struct MarketState {
     books: DashMap<(ExchangeId, Instrument), TopBook>,
     funding: DashMap<(ExchangeId, Instrument), FundingInfo>,
+    tickers: DashMap<(ExchangeId, Instrument), TickerEntry>,
+    history: SpreadHistory,
     staleness: Duration,
 }
 
 impl MarketState {
     pub fn new(staleness: Duration) -> Self {
+        Self::with_dynamics(staleness, DynamicsConfig::default())
+    }
+
+    pub fn with_dynamics(staleness: Duration, dynamics: DynamicsConfig) -> Self {
         MarketState {
             books: DashMap::new(),
             funding: DashMap::new(),
+            tickers: DashMap::new(),
+            history: SpreadHistory::new(dynamics),
             staleness,
         }
+    }
+
+    /// Record a representative net spread sample for an instrument (called by
+    /// the drain loop) to feed the rolling dynamics statistics.
+    pub fn record_spread(&self, instrument: &Instrument, net: Decimal, now: Instant) {
+        self.history.record(instrument, net, now);
     }
 
     pub fn staleness(&self) -> Duration {
@@ -59,6 +80,16 @@ impl MarketState {
                 );
                 None
             }
+            MarketUpdate::Ticker {
+                exchange,
+                instrument,
+                quote_volume_24h,
+                open_interest,
+            } => {
+                self.tickers
+                    .insert((exchange, instrument), (quote_volume_24h, open_interest));
+                None
+            }
         }
     }
 
@@ -80,10 +111,17 @@ impl MarketState {
                 .funding
                 .get(&(*ex, inst.clone()))
                 .map(|f| f.clone());
+            let (quote_volume_24h, open_interest) = self
+                .tickers
+                .get(&(*ex, inst.clone()))
+                .map(|t| t.clone())
+                .unwrap_or((None, None));
             quotes.push(ExchangeQuote {
                 exchange: *ex,
                 book: book.clone(),
                 funding,
+                quote_volume_24h,
+                open_interest,
                 stale,
                 valid,
             });
@@ -91,6 +129,7 @@ impl MarketState {
         InstrumentSnapshot {
             instrument: instrument.clone(),
             quotes,
+            stats: self.history.stats(instrument, now),
         }
     }
 

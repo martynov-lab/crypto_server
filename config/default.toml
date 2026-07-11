@@ -9,14 +9,22 @@ bind = "127.0.0.1:8080"
 [ingest]
 # Which exchanges to connect. Must be a subset of the 8 supported ids.
 exchanges = ["bybit", "okx", "mexc", "bitget", "gate", "coinex", "kucoin", "phemex"]
-# Canonical base assets to screen (quote is `quote` below). Perp only in Phase 1.
-# Keep this list small at first; every symbol is a subscription on every exchange.
-symbols = ["BTC", "ETH", "SOL", "ARB", "OP", "SUI", "APT", "TIA", "SEI", "WLD"]
 quote = "USDT"
 # Book depth levels to request/keep per instrument (spec §13: start 10–25).
 depth_levels = 20
 # A book older than this (by local monotonic recv time) is excluded from spreads.
 staleness_ms = 3000
+
+# --- Universe auto-discovery ---
+# When true, poll each exchange's public contracts endpoint and screen every base
+# listed on >= min_venues exchanges (capped at max_symbols, most-covered first),
+# instead of the hardcoded `symbols` list. This is where 2–20% alt spreads live.
+auto_discover = true
+min_venues = 2
+max_symbols = 150
+discovery_interval_secs = 900
+# Fallback / seed list used when auto_discover = false (or discovery fails).
+symbols = ["BTC", "ETH", "SOL", "ARB", "OP", "SUI", "APT", "TIA", "SEI", "WLD"]
 
 [ingest.reconnect]
 # Exponential backoff with jitter for exchange WS reconnects.
@@ -64,6 +72,13 @@ funding_hold_hours = "8"
 require_transferable = false      # settlement asset deposit+withdraw enabled on both legs
 require_common_network = false    # both legs share >=1 enabled chain for settlement asset
 max_book_age_ms = 3000
+
+# Spread dynamics — the "tight baseline, brief spike" signature of a good arb coin.
+enable_dynamics = true
+max_baseline_spread_pct = "0.01"  # reject coins whose median spread is persistently wide
+min_spike_z = "3"                 # current spread must be >=3 stddevs above its own mean
+max_spread_duration_ms = 300000   # reject spreads that stay wide > 5 min (trap)
+min_dynamics_samples = 20         # warmup before dynamics filters apply
 
 # Noise control.
 hysteresis_step_pct = "0.005"     # re-alert only when spread widens 0.5% past prior peak

@@ -77,13 +77,29 @@ Backpressure: each session has its own screening engine reading shared state; a
 slow client only slows its own send loop (the fan-out tolerates lag), never the
 core.
 
+## Beyond the base screener
+
+- **Universe auto-discovery.** On startup (and every 15 min) the server polls each
+  venue's public contracts endpoint and screens every base listed on ≥ N venues
+  (`config/default.toml → [ingest] auto_discover`), instead of a hardcoded list —
+  ~800 arb-relevant coins live, where the real 2–20% spreads are. The catalog is
+  exposed via `GET /instruments` and pushed to WS clients as a `universe` message.
+- **Spread dynamics.** Per-coin rolling statistics (baseline median, spike
+  z-score, above-threshold episode duration) filter out *persistently wide*
+  spreads (structural traps) and keep the healthy "tight baseline, brief spike"
+  pattern. Each signal carries a `dynamics` block and a 0–100 `quality_score`.
+- **Liquidity floors.** `min_24h_quote_volume` / `min_open_interest` are enforced
+  from ticker data (currently Bybit; other venues report volume in base/contract
+  units and are a follow-up).
+
 ## Status / caveats
 
 - **Bybit & OKX** connectors are the reference implementations. The other six are
   written to the same pattern but their subscribe payloads / field names need a
-  live smoke test — see `docs/EXCHANGE_ENDPOINTS.md`.
+  live smoke test — see `docs/EXCHANGE_ENDPOINTS.md`. (All eight *discovery*
+  fetchers are live-verified.)
 - Transfer-status uses **public** endpoints only (Gate + KuCoin parsed; Bitget /
   CoinEx / Phemex are stubs; Bybit / OKX / MEXC need read-only keys in a later
   phase). Transfer filters default to off so the demo still produces signals.
-- 24h-volume and open-interest filters are accepted but not yet enforced (ticker
-  volume/OI ingestion is a follow-up).
+- Volume/OI ingestion is currently Bybit-only (clean quote-volume + OI fields);
+  other venues report volume in base/contract units and need conversion.

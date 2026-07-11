@@ -1,6 +1,7 @@
 //! Read-side views over market state, consumed by the screener.
 
-use domain::{ExchangeId, FundingInfo, Instrument, TopBook};
+use crate::dynamics::SpreadStats;
+use domain::{Decimal, ExchangeId, FundingInfo, Instrument, TopBook};
 
 /// One exchange's current view of an instrument, with freshness/validity flags
 /// already evaluated by [`super::MarketState::snapshot`].
@@ -9,6 +10,10 @@ pub struct ExchangeQuote {
     pub exchange: ExchangeId,
     pub book: TopBook,
     pub funding: Option<FundingInfo>,
+    /// 24h quote volume (USDT) reported by this venue, if any.
+    pub quote_volume_24h: Option<Decimal>,
+    /// Open interest (base units) reported by this venue, if any.
+    pub open_interest: Option<Decimal>,
     pub stale: bool,
     pub valid: bool,
 }
@@ -25,6 +30,8 @@ impl ExchangeQuote {
 pub struct InstrumentSnapshot {
     pub instrument: Instrument,
     pub quotes: Vec<ExchangeQuote>,
+    /// Rolling spread statistics for this instrument, if any samples exist.
+    pub stats: Option<SpreadStats>,
 }
 
 impl InstrumentSnapshot {

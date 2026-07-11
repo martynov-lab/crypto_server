@@ -15,6 +15,7 @@ ingest.workspace = true
 market_state.workspace = true
 screener.workspace = true
 transfer_status.workspace = true
+universe.workspace = true
 api.workspace = true
 auth.workspace = true
 persistence.workspace = true

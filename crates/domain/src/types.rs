@@ -144,6 +144,15 @@ pub enum MarketUpdate {
         interval_hours: Decimal,
         next_ts: i64,
     },
+    /// 24h volume / open-interest stats from a venue's ticker stream.
+    Ticker {
+        exchange: ExchangeId,
+        instrument: Instrument,
+        /// 24h traded volume in quote (USDT), if the venue reports it.
+        quote_volume_24h: Option<Decimal>,
+        /// Open interest in base units, if reported.
+        open_interest: Option<Decimal>,
+    },
 }
 
 impl MarketUpdate {
@@ -151,6 +160,7 @@ impl MarketUpdate {
         match self {
             MarketUpdate::Book { exchange, .. } => *exchange,
             MarketUpdate::Funding { exchange, .. } => *exchange,
+            MarketUpdate::Ticker { exchange, .. } => *exchange,
         }
     }
 
@@ -158,6 +168,7 @@ impl MarketUpdate {
         match self {
             MarketUpdate::Book { instrument, .. } => instrument,
             MarketUpdate::Funding { instrument, .. } => instrument,
+            MarketUpdate::Ticker { instrument, .. } => instrument,
         }
     }
 }

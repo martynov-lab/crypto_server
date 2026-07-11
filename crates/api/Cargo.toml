@@ -8,6 +8,7 @@ license.workspace = true
 domain.workspace = true
 market_state.workspace = true
 screener.workspace = true
+universe.workspace = true
 auth.workspace = true
 axum.workspace = true
 tokio.workspace = true

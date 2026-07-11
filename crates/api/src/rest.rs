@@ -59,6 +59,12 @@ pub async fn summary(State(state): State<AppState>) -> impl IntoResponse {
     Json(rows)
 }
 
+/// Traded-instrument catalog: which base assets have a USDT perp on which venues.
+pub async fn instruments(State(state): State<AppState>) -> impl IntoResponse {
+    let quote = &state.default_cfg.quote;
+    Json(crate::session::build_catalog(&state.universe, quote, 1))
+}
+
 /// Validate a client-supplied config without subscribing.
 pub async fn validate_config(Json(cfg): Json<ClientConfig>) -> impl IntoResponse {
     match cfg.validate() {

@@ -7,7 +7,8 @@ use crate::executable::{executable_spread, ExecSpread};
 use crate::funding::{best_funding_diff, FundingSignal};
 use domain::transfer::has_common_transfer_route;
 use domain::{Decimal, ExchangeId, Spread, SpreadReason, TransferStatus};
-use market_state::InstrumentSnapshot;
+use market_state::{ExchangeQuote, InstrumentSnapshot, SpreadStats};
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 /// Read-only source of transfer status, implemented by the `transfer_status`
 /// crate. Kept as a trait so the screener has no dependency cycle and tests can
@@ -30,6 +31,10 @@ pub struct Evaluation {
     pub spread: Spread,
     pub reason: SpreadReason,
     pub funding: Option<FundingSignal>,
+    /// Rolling spread statistics for the instrument (if available).
+    pub stats: Option<SpreadStats>,
+    /// 0–100 arb-quality score (tight baseline + strong spike + brief + covered).
+    pub quality_score: Option<Decimal>,
 }
 
 /// Evaluate the best pairing for `snapshot` under `cfg`. Returns `None` only
@@ -104,22 +109,31 @@ pub fn evaluate(
         capped_by_depth: es.capped_by_depth,
     };
 
-    let reason = classify(&es, cfg, oracle, buy_ex, sell_ex);
+    let stats = snapshot.stats.clone();
+    let reason = classify(&es, cfg, oracle, quotes[bi], quotes[sj], stats.as_ref());
+    let quality_score = stats
+        .as_ref()
+        .map(|st| quality_score(st, quotes.len(), cfg.max_spread_duration_ms));
     Some(Evaluation {
         spread,
         reason,
         funding,
+        stats,
+        quality_score,
     })
 }
 
-/// Apply band, depth, and transfer filters to a best pairing.
+/// Apply band, depth, liquidity, dynamics, and transfer filters to a best pairing.
 fn classify(
     es: &ExecSpread,
     cfg: &ClientConfig,
     oracle: &dyn TransferOracle,
-    buy_ex: ExchangeId,
-    sell_ex: ExchangeId,
+    buy_q: &ExchangeQuote,
+    sell_q: &ExchangeQuote,
+    stats: Option<&SpreadStats>,
 ) -> SpreadReason {
+    let buy_ex = buy_q.exchange;
+    let sell_ex = sell_q.exchange;
     if es.net_pct < cfg.min_net_spread_pct {
         return SpreadReason::BelowMinSpread;
     }
@@ -129,10 +143,73 @@ fn classify(
     if es.executable_notional < cfg.min_executable_notional {
         return SpreadReason::InsufficientDepth;
     }
+    // Liquidity floors. Applied against the higher of the two legs' reported
+    // figures; skipped when neither venue reports the metric (unknown).
+    if cfg.min_24h_quote_volume > Decimal::ZERO {
+        if let Some(vol) = max_opt(buy_q.quote_volume_24h, sell_q.quote_volume_24h) {
+            if vol < cfg.min_24h_quote_volume {
+                return SpreadReason::BelowMinVolume;
+            }
+        }
+    }
+    if let Some(min_oi) = cfg.min_open_interest {
+        if min_oi > Decimal::ZERO {
+            if let Some(oi) = max_opt(buy_q.open_interest, sell_q.open_interest) {
+                if oi < min_oi {
+                    return SpreadReason::BelowMinOpenInterest;
+                }
+            }
+        }
+    }
+    // Spread-dynamics filters: reject persistently-wide, non-spike, or too-long
+    // episodes once enough history exists (skip during warmup).
+    if cfg.enable_dynamics {
+        if let Some(st) = stats {
+            if st.sample_count >= cfg.min_dynamics_samples as usize {
+                if st.baseline_pct > cfg.max_baseline_spread_pct {
+                    return SpreadReason::PersistentWide;
+                }
+                match st.z_score {
+                    Some(z) if z >= cfg.min_spike_z => {}
+                    _ => return SpreadReason::NotASpike,
+                }
+                if st.episode_ms > cfg.max_spread_duration_ms {
+                    return SpreadReason::TooPersistent;
+                }
+            }
+        }
+    }
     if let Err(r) = transfer_ok(cfg, oracle, buy_ex, sell_ex) {
         return r;
     }
     SpreadReason::Signal
+}
+
+/// Max of two optional decimals; `None` only when both are `None`.
+fn max_opt(a: Option<Decimal>, b: Option<Decimal>) -> Option<Decimal> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// 0–100 arb-quality score: rewards a tight baseline, a strong current spike,
+/// short episode duration, and broad venue coverage.
+fn quality_score(stats: &SpreadStats, coverage: usize, max_dur_ms: u64) -> Decimal {
+    let clamp01 = |x: f64| x.clamp(0.0, 1.0);
+    let baseline = stats.baseline_pct.to_f64().unwrap_or(0.0);
+    let z = stats.z_score.and_then(|d| d.to_f64()).unwrap_or(0.0);
+    let episode = stats.episode_ms as f64;
+
+    let tightness = clamp01(1.0 - baseline / 0.02); // baseline 0 → 1, ≥2% → 0
+    let spike = clamp01(z / 6.0);
+    let transience = clamp01(1.0 - episode / (max_dur_ms.max(1) as f64));
+    let cov = clamp01(coverage as f64 / 4.0);
+
+    let score = 100.0 * (0.35 * tightness + 0.30 * spike + 0.20 * transience + 0.15 * cov);
+    Decimal::from_f64(score).unwrap_or_default().round_dp(1)
 }
 
 /// Settlement-asset transferability between the two venues (perp margin

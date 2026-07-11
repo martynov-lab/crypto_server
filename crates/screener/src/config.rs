@@ -54,6 +54,21 @@ pub struct ClientConfig {
     /// Books older than this (ms) are excluded.
     pub max_book_age_ms: u64,
 
+    // --- Spread dynamics (tight-baseline-with-spikes detection) ---
+    /// Master switch for the dynamics filters below.
+    pub enable_dynamics: bool,
+    /// Reject coins whose *baseline* (median) spread is above this — a
+    /// persistently wide spread is a structural break, not an opportunity.
+    pub max_baseline_spread_pct: Decimal,
+    /// Require the current spread to be at least this many stddevs above its
+    /// own mean (a genuine spike, not "it's always wide").
+    pub min_spike_z: Decimal,
+    /// Reject a spread that has stayed above threshold longer than this — a
+    /// healthy arb closes fast; a long-lived wide gap is a trap.
+    pub max_spread_duration_ms: u64,
+    /// Don't apply dynamics filters until this many samples exist (warmup).
+    pub min_dynamics_samples: u32,
+
     // --- Noise control ---
     pub hysteresis_step_pct: Decimal,
     pub min_signal_lifetime_ms: u64,
@@ -85,6 +100,11 @@ impl Default for ClientConfig {
             require_transferable: false,
             require_common_network: false,
             max_book_age_ms: 3000,
+            enable_dynamics: true,
+            max_baseline_spread_pct: dec_lit("0.01"),
+            min_spike_z: dec_lit("3"),
+            max_spread_duration_ms: 300_000,
+            min_dynamics_samples: 20,
             hysteresis_step_pct: dec_lit("0.005"),
             min_signal_lifetime_ms: 1500,
             cooldown_ms: 2000,

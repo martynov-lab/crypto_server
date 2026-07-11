@@ -83,6 +83,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     };
 
     info!(exchanges = ?cfg.exchanges, "client subscribed");
+    let quote = cfg.quote.clone();
     let mut engine = ScreenerEngine::new(cfg.clone());
     if !send(
         &mut ws_tx,
@@ -92,6 +93,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     )
     .await
     {
+        return;
+    }
+    // Send the traded-instrument catalog once (arb-relevant coins, >=2 venues).
+    let catalog = crate::session::build_catalog(&state.universe, &quote, 2);
+    if !send(&mut ws_tx, &ServerMessage::Universe { instruments: catalog }).await {
         return;
     }
 

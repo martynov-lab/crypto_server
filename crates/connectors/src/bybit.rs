@@ -141,6 +141,7 @@ impl WsExchange for Bybit {
                 return vec![];
             };
             let Some(data) = data else { return vec![] };
+            let mut out = Vec::new();
             // fundingRate is absent in deltas that don't change it — only emit when present.
             if let Some(rate) = data.get("fundingRate").and_then(Value::as_str).and_then(dec_from_str) {
                 let next_ts = data
@@ -148,14 +149,26 @@ impl WsExchange for Bybit {
                     .and_then(Value::as_str)
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(0);
-                return vec![MarketUpdate::Funding {
+                out.push(MarketUpdate::Funding {
                     exchange: ExchangeId::Bybit,
                     instrument: inst.clone(),
                     rate,
                     interval_hours: Decimal::from(8), // Bybit linear default; some symbols differ
                     next_ts,
-                }];
+                });
             }
+            // turnover24h = 24h quote volume (USDT); openInterest = base units.
+            let vol = data.get("turnover24h").and_then(Value::as_str).and_then(dec_from_str);
+            let oi = data.get("openInterest").and_then(Value::as_str).and_then(dec_from_str);
+            if vol.is_some() || oi.is_some() {
+                out.push(MarketUpdate::Ticker {
+                    exchange: ExchangeId::Bybit,
+                    instrument: inst.clone(),
+                    quote_volume_24h: vol,
+                    open_interest: oi,
+                });
+            }
+            return out;
         }
         vec![]
     }

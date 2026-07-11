@@ -44,6 +44,13 @@ pub enum SpreadReason {
     NoCommonNetwork,
     StaleBook,
     BelowMinVolume,
+    BelowMinOpenInterest,
+    /// Baseline spread is persistently wide — structural break, not opportunity.
+    PersistentWide,
+    /// Current spread isn't a genuine outlier vs its own baseline.
+    NotASpike,
+    /// Spread has stayed wide too long — likely a trap that never converges.
+    TooPersistent,
 }
 
 #[cfg(test)]
