@@ -23,6 +23,8 @@ pub struct ChartParams {
     pub max_window_ms: u64,
     /// Max concurrent watches per WS session.
     pub max_watches: usize,
+    /// Global hard anomaly cap for chart points (client cap only tightens it).
+    pub sanity_max_spread_pct: domain::Decimal,
 }
 
 /// Shared, cheaply-cloneable application state handed to every handler.

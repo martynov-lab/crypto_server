@@ -132,44 +132,71 @@ session's screening engine (hysteresis/lifetime state resets) and returns a fres
 
 Independent of `subscribe`: opening a coin's chart streams that instrument's
 **raw** spread — sampled at a fixed cadence, **not** deduplicated/hysteresis'd —
-so it draws a continuous line. Runs over the same `/ws`. Up to **3 concurrent
-watches** per session.
+for a **fixed long/short pair**, so it draws two continuous lines (In / Out).
+Runs over the same `/ws`. Up to **3 concurrent watches** per session.
 
-**Start watching** (client → server):
+**Start watching** (client → server) — pin the pair from the tapped signal card
+(`long_exchange` = signal's `buy_exchange`, `short_exchange` = `sell_exchange`):
 ```json
 { "type": "watch",
   "instrument": { "base": "ARB", "quote": "USDT", "kind": "perp" },
-  "window_ms": 900000 }
+  "window_ms": 900000,
+  "long_exchange": "mexc",
+  "short_exchange": "kucoin" }
 ```
-`window_ms` (optional, default 900000, clamped to the server cap) is how much
-history to backfill. `resolution_ms` may be sent but the server picks the actual
-cadence and echoes it.
+`window_ms` (optional, default 900000, clamped to server cap) is how much history
+to backfill. `resolution_ms` may be sent but the server picks the cadence and
+echoes it. **If `long_exchange`/`short_exchange` are omitted, the server fixes the
+best pair at open time and holds it** — the pair does not "jump" tick-to-tick,
+which removes the noise of the old single-line best-pair chart.
 
-**Backfill** (server → client, once) fills the window instantly:
+**Backfill** (server → client, once) fills the window instantly, with the pair
+and funding header for labels + the "next funding in mm:ss" timer:
 ```json
 { "type": "watch_snapshot",
   "instrument": { "base": "ARB", "quote": "USDT", "kind": "perp" },
   "resolution_ms": 1000, "window_ms": 900000,
-  "points": [ { "ts_ms": 1752230400000, "net_pct": "0.0031", "baseline_pct": "0.0030",
-               "buy_exchange": "mexc", "sell_exchange": "kucoin",
-               "executable_notional": "2000", "capped_by_depth": false } ] }
+  "long_exchange": "mexc", "short_exchange": "kucoin",
+  "funding_interval_hours": "8", "next_funding_ms": 1752231600000,
+  "funding_long_apr": "0.1083", "funding_short_apr": "0.0848",
+  "points": [
+    { "ts_ms": 1752230400000, "net_pct": "0.0031", "in_pct": "0.0031", "out_pct": "-0.0016",
+      "baseline_pct": "0.0030", "buy_exchange": "mexc", "sell_exchange": "kucoin",
+      "executable_notional": "2000", "capped_by_depth": false,
+      "funding_long_pct": "0.0001", "funding_short_pct": "0.00008" }
+  ] }
 ```
 
 **Live ticks** (server → client, one per `resolution_ms`):
 ```json
 { "type": "spread_tick",
   "instrument": { "base": "ARB", "quote": "USDT", "kind": "perp" },
-  "point": { "ts_ms": 1752230402000, "net_pct": "0.0289", "baseline_pct": "0.0031",
-             "buy_exchange": "mexc", "sell_exchange": "kucoin",
-             "executable_notional": "2000", "capped_by_depth": false } }
+  "point": { "ts_ms": 1752230402000, "net_pct": "0.0289", "in_pct": "0.0289", "out_pct": "-0.0010",
+             "baseline_pct": "0.0031", "buy_exchange": "mexc", "sell_exchange": "kucoin",
+             "executable_notional": "2000", "capped_by_depth": false,
+             "funding_long_pct": "0.0001", "funding_short_pct": "0.00008" } }
 ```
-Append each `point` to the line and drop points older than `window_ms`.
+Append each `point` to both lines and drop points older than `window_ms`.
 
-**Point fields:** `ts_ms` (X axis), `net_pct` (primary line, net of default
-fees), `baseline_pct` (reference band = rolling median), `gross_pct` (optional),
-`buy_exchange`/`sell_exchange` (which venues form the spread *right now* — can
-change), `executable_notional` + `capped_by_depth` (**entry quality**: real depth
-vs mirage — `capped_by_depth: true` means the book can't supply full size).
+**Point fields:**
+- `ts_ms` — X axis.
+- **`in_pct`** — **entry spread** (open: buy long-leg at ask + sell short-leg at
+  bid), net of default fees → **green line**. You want this high to enter.
+- **`out_pct`** — **exit spread** (close: sell long-leg at bid + buy short-leg at
+  ask), net of fees, usually ≤ 0 → **red line**. Reverts toward 0 as the pair
+  converges — that's the exit.
+- `net_pct` — legacy single-line value = `in_pct` (for the old chart).
+- `baseline_pct` — reference band (rolling median), optional.
+- `buy_exchange`/`sell_exchange` — the **fixed** pair (long/short), constant for
+  the whole watch.
+- `executable_notional` + `capped_by_depth` — **entry** depth quality;
+  `capped_by_depth: true` = book can't supply full size (thinner/mirage entry).
+- `funding_long_pct` / `funding_short_pct` — per-leg funding rate at `ts` (fraction
+  per interval; may step-repeat the last value — funding changes rarely).
+
+**Header (in `watch_snapshot`):** `long_exchange`, `short_exchange`,
+`funding_interval_hours`, `next_funding_ms` (soonest of the two legs — for the
+countdown), `funding_long_apr`/`funding_short_apr` (annualized, for the labels).
 
 **Stop watching:**
 ```json
@@ -189,9 +216,11 @@ everyone. On top of that, each client can tighten its own chart via
 whose `abs(net_pct)` exceeds it are not delivered to that client. Send a new
 `subscribe` then re-`watch` to change it (watches capture the cap at watch time).
 
-**REST fallback:** `GET /spread/history?base=ARB&quote=USDT&window_ms=900000`
-returns `{ instrument, resolution_ms, window_ms, points[] }` (same point shape)
-for a cold render without an open socket.
+**REST fallback:**
+`GET /spread/history?base=ARB&quote=USDT&window_ms=900000&long_exchange=mexc&short_exchange=kucoin`
+returns `{ instrument, resolution_ms, window_ms, long_exchange, short_exchange, points[] }`
+(same In/Out point shape) for a cold render without an open socket. Omit the pair
+params to let the server pick the best pair.
 
 ### 2.5 Reconnect
 

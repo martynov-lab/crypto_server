@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use domain::{Decimal, ExchangeId};
-use screener::{best_raw_net, ClientConfig};
+use screener::{best_pair, best_raw_net, chart_point, ClientConfig};
 use serde::Serialize;
 use std::time::Instant;
 
@@ -72,6 +72,10 @@ pub struct HistoryQuery {
     pub quote: String,
     #[serde(default = "default_window")]
     pub window_ms: u64,
+    #[serde(default)]
+    pub long_exchange: Option<ExchangeId>,
+    #[serde(default)]
+    pub short_exchange: Option<ExchangeId>,
 }
 
 fn default_quote() -> String {
@@ -81,30 +85,51 @@ fn default_window() -> u64 {
     900_000
 }
 
-/// REST fallback for the spread chart: the buffered points for one instrument.
+/// REST fallback for the spread chart: the buffered In/Out points for one
+/// instrument's fixed long/short pair (pinned, or best pair at request time).
 pub async fn spread_history(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
 ) -> impl IntoResponse {
     let instrument = domain::Instrument::perp(&q.base, &q.quote);
     let window = q.window_ms.min(state.chart.max_window_ms);
-    match state.tape.history(&instrument, window) {
-        Some(points) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "instrument": instrument,
-                "resolution_ms": state.tape.resolution_ms(),
-                "window_ms": window,
-                "points": points,
-            })),
-        ),
-        None => (
+    let cfg = &state.default_cfg;
+
+    let not_found = || {
+        (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": format!("no live spread for {}/{}", q.base.to_uppercase(), q.quote.to_uppercase())
             })),
-        ),
-    }
+        )
+    };
+
+    let Some(samples) = state.tape.history(&instrument, window) else {
+        return not_found();
+    };
+    let pair = match (q.long_exchange, q.short_exchange) {
+        (Some(l), Some(s)) if l != s => Some((l, s)),
+        _ => samples.last().and_then(|s| best_pair(s, cfg)),
+    };
+    let Some((long, short)) = pair else {
+        return not_found();
+    };
+    let points: Vec<_> = samples
+        .iter()
+        .filter_map(|s| chart_point(s, long, short, cfg))
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "instrument": instrument,
+            "resolution_ms": state.tape.resolution_ms(),
+            "window_ms": window,
+            "long_exchange": long,
+            "short_exchange": short,
+            "points": points,
+        })),
+    )
 }
 
 /// Validate a client-supplied config without subscribing.

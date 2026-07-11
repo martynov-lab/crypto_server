@@ -51,6 +51,64 @@ pub struct SpreadPoint {
     pub capped_by_depth: bool,
 }
 
+/// Per-venue VWAP snapshot for one exchange at one sample instant. Stored in the
+/// spread tape so the chart can derive In/Out for **any** fixed pair on backfill,
+/// not just the best pair at each tick.
+#[derive(Debug, Clone)]
+pub struct VenueQuote {
+    pub exchange: ExchangeId,
+    /// VWAP to buy the target size (walk asks).
+    pub vwap_ask: Decimal,
+    /// VWAP to sell the target size (walk bids).
+    pub vwap_bid: Decimal,
+    /// Quote notional actually fillable on each side (for entry/exit depth).
+    pub ask_notional: Decimal,
+    pub bid_notional: Decimal,
+    pub ask_capped: bool,
+    pub bid_capped: bool,
+    /// Latest funding for this leg, if known (per-interval rate).
+    pub funding_rate: Option<Decimal>,
+    pub funding_interval_hours: Option<Decimal>,
+    pub next_funding_ms: Option<i64>,
+}
+
+/// All venues' VWAP quotes for one instrument at one sample instant.
+#[derive(Debug, Clone)]
+pub struct VenueSample {
+    pub ts_ms: i64,
+    /// Rolling median baseline (best-pair dynamics) — reference band.
+    pub baseline_pct: Option<Decimal>,
+    pub venues: Vec<VenueQuote>,
+}
+
+/// One chart point for a **fixed** long/short pair: entry (In) and exit (Out)
+/// executable spreads plus per-leg funding. `net_pct` mirrors `in_pct` for
+/// backward compatibility with the single-line chart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartPoint {
+    pub ts_ms: i64,
+    /// Legacy single-line value; equals `in_pct`.
+    pub net_pct: Decimal,
+    /// Entry spread (buy long-leg ask, sell short-leg bid), net of fees. Green line.
+    pub in_pct: Decimal,
+    /// Exit spread (sell long-leg bid, buy short-leg ask), net of fees. Red line.
+    pub out_pct: Decimal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_pct: Option<Decimal>,
+    /// Long leg (where you buy to open).
+    pub buy_exchange: ExchangeId,
+    /// Short leg (where you sell to open).
+    pub sell_exchange: ExchangeId,
+    /// Entry-side executable notional (min of both legs).
+    pub executable_notional: Decimal,
+    /// Entry-side depth cap flag.
+    pub capped_by_depth: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_long_pct: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_short_pct: Option<Decimal>,
+}
+
 /// Why a candidate spread was surfaced or rejected — attached to events for
 /// client-side explanation and for lifetime/analysis logging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

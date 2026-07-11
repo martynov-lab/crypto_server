@@ -197,19 +197,23 @@ async fn main() -> anyhow::Result<()> {
                         let ts_ms = chrono::Utc::now().timestamp_millis();
                         for instrument in market.instruments() {
                             let snap = market.snapshot(&instrument, now);
+                            // Dynamics feed (best pair) with the sanity guard so a
+                            // data-error spike can't pollute baseline/z-score.
                             if let Some(point) =
                                 screener::best_spread_point(&snap, &default_cfg, ts_ms)
                             {
-                                // Sanity guard: an out-of-range spread is a data
-                                // error (wrong-token / stale quote). Drop it from
-                                // BOTH the tape and the dynamics history so it
-                                // can't pollute the chart or baseline/z-score.
-                                if point.net_pct.abs() > sanity_cap {
+                                if point.net_pct.abs() <= sanity_cap {
+                                    market.record_spread(&instrument, point.net_pct, now);
+                                } else {
                                     metrics::counter!("spread_anomalies_dropped_total").increment(1);
-                                    continue;
                                 }
-                                market.record_spread(&instrument, point.net_pct, now);
-                                tape.record(&instrument, point);
+                            }
+                            // Chart tape: per-venue VWAP snapshot. Pair selection
+                            // and In/Out/funding are derived per-watcher at delivery.
+                            if let Some(sample) =
+                                screener::venue_sample(&snap, &default_cfg, ts_ms)
+                            {
+                                tape.record(&instrument, sample);
                             }
                         }
                     }
@@ -266,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
         chart: ChartParams {
             max_window_ms: settings.chart.window_ms,
             max_watches: settings.chart.max_watches,
+            sanity_max_spread_pct: settings.chart.sanity_max_spread_pct,
         },
         events: events_tx.clone(),
         default_cfg: default_cfg.clone(),

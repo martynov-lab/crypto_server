@@ -12,9 +12,9 @@ use auth::AuthOutcome;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
-use domain::{Decimal, Instrument};
+use domain::{Decimal, ExchangeId, Instrument};
 use futures_util::{SinkExt, StreamExt};
-use screener::ScreenerEngine;
+use screener::{ClientConfig, ScreenerEngine};
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::broadcast::error::RecvError;
@@ -147,9 +147,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 engine = ScreenerEngine::new(newcfg.clone());
                                 let _ = emit(&out_tx, Outbound::Server(ServerMessage::Subscribed { config: Box::new(newcfg) })).await;
                             }
-                            Ok(ClientMessage::Watch { instrument, window_ms, resolution_ms: _ }) => {
-                                let chart_cap = engine.config().max_chart_spread_pct;
-                                handle_watch(&state, &out_tx, &mut watches, instrument, window_ms, chart_cap).await;
+                            Ok(ClientMessage::Watch { instrument, window_ms, resolution_ms: _, long_exchange, short_exchange }) => {
+                                let cfg = engine.config().clone();
+                                handle_watch(&state, &out_tx, &mut watches, instrument, window_ms, (long_exchange, short_exchange), cfg).await;
                             }
                             Ok(ClientMessage::Unwatch { instrument }) => {
                                 if let Some(h) = watches.remove(&instrument) { h.abort(); }
@@ -197,14 +197,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 }
 
 /// Start (or restart) a watch on `instrument`: enforce the per-session cap,
-/// validate coverage, send the backfill, and spawn a live forwarder.
+/// resolve the fixed long/short pair, send the In/Out backfill + funding header,
+/// and spawn a live forwarder that streams In/Out ticks for that pair.
 async fn handle_watch(
     state: &AppState,
     out_tx: &mpsc::Sender<Outbound>,
     watches: &mut HashMap<Instrument, JoinHandle<()>>,
     instrument: Instrument,
     window_ms: Option<u64>,
-    chart_cap: Decimal,
+    pinned: (Option<ExchangeId>, Option<ExchangeId>),
+    cfg: ClientConfig,
 ) {
     // Re-watch replaces an existing stream for the same instrument.
     if let Some(h) = watches.remove(&instrument) {
@@ -221,53 +223,81 @@ async fn handle_watch(
         return;
     }
 
-    let window = window_ms
-        .unwrap_or(900_000)
-        .min(state.chart.max_window_ms);
+    let window = window_ms.unwrap_or(900_000).min(state.chart.max_window_ms);
 
-    let Some(mut w) = state.tape.watch(&instrument, window) else {
-        let _ = emit(
-            out_tx,
-            Outbound::Server(ServerMessage::Error {
-                message: format!("no live spread for {}/{}", instrument.base, instrument.quote),
-            }),
-        )
-        .await;
+    let no_spread = |ex: &Instrument| ServerMessage::Error {
+        message: format!("no live spread for {}/{}", ex.base, ex.quote),
+    };
+
+    let Some(w) = state.tape.watch(&instrument, window) else {
+        let _ = emit(out_tx, Outbound::Server(no_spread(&instrument))).await;
         return;
     };
 
-    // Client-side anomaly filter on the backfill.
-    w.backfill.retain(|p| p.net_pct.abs() <= chart_cap);
+    // Resolve the fixed pair: pinned by the client, else the best pair at open.
+    let (long, short) = match pinned {
+        (Some(l), Some(s)) if l != s => (l, s),
+        _ => match w.backfill.last().and_then(|sample| screener::best_pair(sample, &cfg)) {
+            Some(p) => p,
+            None => {
+                let _ = emit(out_tx, Outbound::Server(no_spread(&instrument))).await;
+                return;
+            }
+        },
+    };
 
-    // Backfill first, so the chart fills instantly.
+    // Effective anomaly cap = global hard cap tightened by the client's cap.
+    let eff_cap = state
+        .chart
+        .sanity_max_spread_pct
+        .min(cfg.max_chart_spread_pct);
+
+    // Transform buffered venue samples into In/Out points for the fixed pair.
+    let points: Vec<_> = w
+        .backfill
+        .iter()
+        .filter_map(|s| screener::chart_point(s, long, short, &cfg))
+        .filter(|p| p.in_pct.abs() <= eff_cap)
+        .collect();
+
+    // Funding header from the latest sample's two legs.
+    let (interval, next_ms, long_apr, short_apr) = funding_header(&w.backfill, long, short);
+
     let _ = emit(
         out_tx,
         Outbound::Server(ServerMessage::WatchSnapshot {
             instrument: instrument.clone(),
             resolution_ms: w.resolution_ms,
             window_ms: window,
-            points: w.backfill,
+            long_exchange: long,
+            short_exchange: short,
+            funding_interval_hours: interval,
+            next_funding_ms: next_ms,
+            funding_long_apr: long_apr,
+            funding_short_apr: short_apr,
+            points,
         }),
     )
     .await;
 
-    // Then stream live ticks until unwatch/disconnect.
+    // Stream live In/Out ticks for the fixed pair until unwatch/disconnect.
     let mut live = w.live;
     let tx = out_tx.clone();
     let inst = instrument.clone();
     let handle = tokio::spawn(async move {
         loop {
             match live.recv().await {
-                Ok(point) => {
-                    // Client-side anomaly filter on live ticks.
-                    if point.net_pct.abs() > chart_cap {
+                Ok(sample) => {
+                    let Some(point) = screener::chart_point(&sample, long, short, &cfg) else {
+                        continue; // pair not present this tick (gap)
+                    };
+                    if point.in_pct.abs() > eff_cap {
                         continue;
                     }
                     let msg = ServerMessage::SpreadTick {
                         instrument: inst.clone(),
                         point,
                     };
-                    // Await-send: broadcast lag coalesces if the client is slow.
                     if tx.send(Outbound::Server(msg)).await.is_err() {
                         break;
                     }
@@ -278,6 +308,50 @@ async fn handle_watch(
         }
     });
     watches.insert(instrument, handle);
+}
+
+/// Annualize a per-interval funding rate.
+fn apr(rate: Option<Decimal>, interval: Option<Decimal>) -> Option<Decimal> {
+    match (rate, interval) {
+        (Some(r), Some(i)) if i > Decimal::ZERO => Some(r * (Decimal::from(24 * 365) / i)),
+        (Some(r), _) => Some(r),
+        _ => None,
+    }
+}
+
+/// Build the funding header (interval, soonest next-funding ms, per-leg APR) from
+/// the latest sample's long/short legs.
+fn funding_header(
+    backfill: &[domain::VenueSample],
+    long: ExchangeId,
+    short: ExchangeId,
+) -> (Option<Decimal>, Option<i64>, Option<Decimal>, Option<Decimal>) {
+    let Some(sample) = backfill.last() else {
+        return (None, None, None, None);
+    };
+    let l = sample.venues.iter().find(|v| v.exchange == long);
+    let s = sample.venues.iter().find(|v| v.exchange == short);
+
+    let interval = l
+        .and_then(|v| v.funding_interval_hours)
+        .or_else(|| s.and_then(|v| v.funding_interval_hours));
+    let next_ms = [
+        l.and_then(|v| v.next_funding_ms),
+        s.and_then(|v| v.next_funding_ms),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|&t| t > 0)
+    .min();
+    let long_apr = apr(
+        l.and_then(|v| v.funding_rate),
+        l.and_then(|v| v.funding_interval_hours),
+    );
+    let short_apr = apr(
+        s.and_then(|v| v.funding_rate),
+        s.and_then(|v| v.funding_interval_hours),
+    );
+    (interval, next_ms, long_apr, short_apr)
 }
 
 /// Snapshot the instrument and run the session's engine over it.

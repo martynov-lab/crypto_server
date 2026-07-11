@@ -2,6 +2,7 @@
 //! filters (`rules`), executable spread math (`executable`), funding
 //! differential (`funding`), and hysteresis/lifetime dedup (`hysteresis`).
 
+pub mod chart;
 pub mod config;
 pub mod executable;
 pub mod funding;
@@ -17,6 +18,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+pub use chart::{best_pair, chart_point, venue_sample};
 pub use config::ClientConfig;
 pub use funding::FundingSignal;
 pub use rules::{

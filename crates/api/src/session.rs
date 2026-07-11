@@ -1,6 +1,6 @@
 //! WS protocol message types exchanged with clients.
 
-use domain::{ExchangeId, Instrument, SpreadPoint};
+use domain::{ChartPoint, Decimal, ExchangeId, Instrument};
 use screener::{ClientConfig, ScreenerEvent};
 use serde::{Deserialize, Serialize};
 use universe::UniverseStore;
@@ -45,13 +45,21 @@ pub enum ClientMessage {
         config: Option<ClientConfig>,
     },
     /// Start streaming an instrument's raw spread for the live chart. Independent
-    /// of `subscribe`; the server backfills then pushes ticks.
+    /// of `subscribe`; the server backfills then pushes ticks. Optionally pin the
+    /// long/short pair (from the tapped signal card); if omitted the server fixes
+    /// the best pair at open time and holds it, so the line doesn't jump.
     Watch {
         instrument: Instrument,
         #[serde(default)]
         window_ms: Option<u64>,
         #[serde(default)]
         resolution_ms: Option<u64>,
+        /// Long leg (where you buy to open) = signal's `buy_exchange`.
+        #[serde(default)]
+        long_exchange: Option<ExchangeId>,
+        /// Short leg (where you sell to open) = signal's `sell_exchange`.
+        #[serde(default)]
+        short_exchange: Option<ExchangeId>,
     },
     /// Stop streaming an instrument's spread.
     Unwatch { instrument: Instrument },
@@ -70,17 +78,30 @@ pub enum ServerMessage {
     Universe { instruments: Vec<CatalogRow> },
     /// A screening signal.
     Event(ScreenerEvent),
-    /// One-shot backfill of the rolling window right after `watch`.
+    /// One-shot backfill of the rolling window right after `watch`, for the fixed
+    /// long/short pair. Header carries the pair and funding meta for labels/timer.
     WatchSnapshot {
         instrument: Instrument,
         resolution_ms: u64,
         window_ms: u64,
-        points: Vec<SpreadPoint>,
+        /// Long leg (buy to open).
+        long_exchange: ExchangeId,
+        /// Short leg (sell to open).
+        short_exchange: ExchangeId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        funding_interval_hours: Option<Decimal>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_funding_ms: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        funding_long_apr: Option<Decimal>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        funding_short_apr: Option<Decimal>,
+        points: Vec<ChartPoint>,
     },
-    /// A live raw-spread sample for a watched instrument.
+    /// A live chart point for a watched instrument's fixed pair.
     SpreadTick {
         instrument: Instrument,
-        point: SpreadPoint,
+        point: ChartPoint,
     },
     /// Server keepalive response.
     Pong,
