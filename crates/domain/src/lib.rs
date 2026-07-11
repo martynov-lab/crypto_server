@@ -13,7 +13,7 @@ pub mod types;
 
 pub use funding::FundingInfo;
 pub use instrument::{Instrument, MarketKind};
-pub use spread::{Spread, SpreadReason};
+pub use spread::{Spread, SpreadPoint, SpreadReason};
 pub use traits::ExchangeConnector;
 pub use transfer::{Network, TransferStatus};
 pub use types::{BookLevel, ExchangeId, MarketUpdate, TopBook, ALL_EXCHANGES};

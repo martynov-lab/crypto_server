@@ -28,6 +28,29 @@ pub struct Spread {
     pub capped_by_depth: bool,
 }
 
+/// One raw sample of an instrument's best executable spread at an instant, used
+/// to drive the real-time chart. Computed at a fixed cadence with default/shared
+/// fees and **decoupled from the alert engine** (no hysteresis/cooldown).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpreadPoint {
+    /// Epoch milliseconds of the sample.
+    pub ts_ms: i64,
+    /// Best net-of-fees spread (primary chart line).
+    pub net_pct: Decimal,
+    /// Gross spread before fees (optional secondary line).
+    pub gross_pct: Decimal,
+    /// Rolling median baseline (reference band), if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_pct: Option<Decimal>,
+    /// Venues forming the best spread at this instant (can change over time).
+    pub buy_exchange: ExchangeId,
+    pub sell_exchange: ExchangeId,
+    /// Executable notional (USDT) available on both legs right now.
+    pub executable_notional: Decimal,
+    /// True when the book can't supply the full target size (thinner entry).
+    pub capped_by_depth: bool,
+}
+
 /// Why a candidate spread was surfaced or rejected — attached to events for
 /// client-side explanation and for lifetime/analysis logging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

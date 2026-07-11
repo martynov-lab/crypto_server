@@ -67,15 +67,24 @@ configs.
 - `GET  /healthz` — liveness + instrument count
 - `GET  /metrics` — Prometheus text
 - `GET  /summary` — current best net spread per instrument (default config)
+- `GET  /instruments` — traded-coin catalog (coins × venues)
+- `GET  /spread/history?base=…&quote=…&window_ms=…` — spread chart history (fallback)
 - `POST /config/validate` — validate a `ClientConfig` body
 - `GET  /ws` — WebSocket:
   1. client → `{"type":"subscribe","config":{...ClientConfig...}}` (config optional)
   2. server → `{"type":"subscribed","config":{...}}`
-  3. server → `{"type":"event","spread":{...},"funding":{...},"ts_ms":...}` stream
+  3. server → `{"type":"subscribed",...}` then `{"type":"universe",...}` (catalog)
+  4. server → `{"type":"event","spread":{...},"dynamics":{...},"quality_score":"66.2",...}` stream
 
-Backpressure: each session has its own screening engine reading shared state; a
-slow client only slows its own send loop (the fan-out tolerates lag), never the
-core.
+**Live spread chart** (same socket, independent of the alert filters): send
+`{"type":"watch","instrument":{...},"window_ms":900000}` → get a one-shot
+`watch_snapshot` (buffered backfill) then `spread_tick` messages at a fixed
+cadence (default 1 s), decoupled from the alert engine's dedup. `unwatch` to stop.
+See `docs/CLIENT_INTEGRATION.md` §2.45.
+
+Backpressure: each session has its own screening engine reading shared state and
+a single writer task; a slow client drops intermediate events/ticks (latest-wins)
+rather than stalling the core.
 
 ## Beyond the base screener
 

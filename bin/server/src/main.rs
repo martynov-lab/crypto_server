@@ -5,7 +5,7 @@
 mod settings;
 
 use anyhow::Context;
-use api::AppState;
+use api::{AppState, ChartParams};
 use auth::AuthPolicy;
 use connectors::{build_connector, common::Backoff};
 use domain::{ExchangeId, Instrument};
@@ -95,6 +95,11 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(settings.ingest.staleness_ms),
         dynamics_cfg,
     ));
+    let tape = Arc::new(spread_tape::SpreadTape::new(
+        Duration::from_millis(settings.chart.window_ms),
+        Duration::from_millis(settings.chart.resolution_ms),
+        128,
+    ));
     let store = Arc::new(TransferStore::new());
     let (events_tx, _events_rx) = broadcast::channel::<Instrument>(1024);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -146,11 +151,10 @@ async fn main() -> anyhow::Result<()> {
 
     let default_cfg = Arc::new(settings.default_client.clone());
 
-    // Drain updates → market state → record spread history → notify sessions.
+    // Drain updates → market state → notify sessions.
     {
         let market = market.clone();
         let events_tx = events_tx.clone();
-        let default_cfg = default_cfg.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             loop {
@@ -159,15 +163,6 @@ async fn main() -> anyhow::Result<()> {
                         Some(update) => {
                             metrics::counter!("market_updates_total").increment(1);
                             if let Some(instrument) = market.apply(update) {
-                                // Record a representative best spread (default fees)
-                                // to feed the rolling dynamics statistics.
-                                let now = std::time::Instant::now();
-                                let snap = market.snapshot(&instrument, now);
-                                if let Some((_, _, net)) =
-                                    screener::best_raw_net(&snap, &default_cfg)
-                                {
-                                    market.record_spread(&instrument, net, now);
-                                }
                                 // Ok if there are currently no subscribers.
                                 let _ = events_tx.send(instrument);
                             }
@@ -180,6 +175,50 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             info!("ingest drain loop stopped");
+        });
+    }
+
+    // Fixed-cadence spread sampler: every resolution_ms, sample each screened
+    // instrument's raw best spread into the dynamics history and the chart tape.
+    // Decoupled from the alert engine (no hysteresis/cooldown/filters).
+    {
+        let market = market.clone();
+        let tape = tape.clone();
+        let default_cfg = default_cfg.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        let resolution = Duration::from_millis(settings.chart.resolution_ms);
+        let sanity_cap = settings.chart.sanity_max_spread_pct;
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(resolution);
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        let now = std::time::Instant::now();
+                        let ts_ms = chrono::Utc::now().timestamp_millis();
+                        for instrument in market.instruments() {
+                            let snap = market.snapshot(&instrument, now);
+                            if let Some(point) =
+                                screener::best_spread_point(&snap, &default_cfg, ts_ms)
+                            {
+                                // Sanity guard: an out-of-range spread is a data
+                                // error (wrong-token / stale quote). Drop it from
+                                // BOTH the tape and the dynamics history so it
+                                // can't pollute the chart or baseline/z-score.
+                                if point.net_pct.abs() > sanity_cap {
+                                    metrics::counter!("spread_anomalies_dropped_total").increment(1);
+                                    continue;
+                                }
+                                market.record_spread(&instrument, point.net_pct, now);
+                                tape.record(&instrument, point);
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() { break; }
+                    }
+                }
+            }
+            info!("spread sampler stopped");
         });
     }
 
@@ -223,6 +262,11 @@ async fn main() -> anyhow::Result<()> {
         market: market.clone(),
         oracle,
         universe: universe_store.clone(),
+        tape: tape.clone(),
+        chart: ChartParams {
+            max_window_ms: settings.chart.window_ms,
+            max_watches: settings.chart.max_watches,
+        },
         events: events_tx.clone(),
         default_cfg: default_cfg.clone(),
         auth: Arc::new(AuthPolicy::default()),

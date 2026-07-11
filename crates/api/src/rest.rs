@@ -65,6 +65,48 @@ pub async fn instruments(State(state): State<AppState>) -> impl IntoResponse {
     Json(crate::session::build_catalog(&state.universe, quote, 1))
 }
 
+#[derive(serde::Deserialize)]
+pub struct HistoryQuery {
+    pub base: String,
+    #[serde(default = "default_quote")]
+    pub quote: String,
+    #[serde(default = "default_window")]
+    pub window_ms: u64,
+}
+
+fn default_quote() -> String {
+    "USDT".to_string()
+}
+fn default_window() -> u64 {
+    900_000
+}
+
+/// REST fallback for the spread chart: the buffered points for one instrument.
+pub async fn spread_history(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> impl IntoResponse {
+    let instrument = domain::Instrument::perp(&q.base, &q.quote);
+    let window = q.window_ms.min(state.chart.max_window_ms);
+    match state.tape.history(&instrument, window) {
+        Some(points) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "instrument": instrument,
+                "resolution_ms": state.tape.resolution_ms(),
+                "window_ms": window,
+                "points": points,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no live spread for {}/{}", q.base.to_uppercase(), q.quote.to_uppercase())
+            })),
+        ),
+    }
+}
+
 /// Validate a client-supplied config without subscribing.
 pub async fn validate_config(Json(cfg): Json<ClientConfig>) -> impl IntoResponse {
     match cfg.validate() {

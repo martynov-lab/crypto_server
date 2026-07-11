@@ -8,6 +8,7 @@ members = [
     "crates/screener",
     "crates/transfer_status",
     "crates/universe",
+    "crates/spread_tape",
     "crates/api",
     "crates/auth",
     "crates/persistence",
@@ -68,6 +69,7 @@ market_state = { path = "crates/market_state" }
 screener = { path = "crates/screener" }
 transfer_status = { path = "crates/transfer_status" }
 universe = { path = "crates/universe" }
+spread_tape = { path = "crates/spread_tape" }
 api = { path = "crates/api" }
 auth = { path = "crates/auth" }
 persistence = { path = "crates/persistence" }

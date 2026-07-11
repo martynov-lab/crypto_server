@@ -69,6 +69,13 @@ pub struct ClientConfig {
     /// Don't apply dynamics filters until this many samples exist (warmup).
     pub min_dynamics_samples: u32,
 
+    // --- Chart (watch stream) ---
+    /// Per-client anomaly cutoff for the live spread chart: watch backfill and
+    /// ticks with `|net_pct|` above this are dropped before delivery to this
+    /// client (a wrong-token / stale-quote spike is a data error, not a signal).
+    /// The server also enforces a global hard cap; this only tightens it.
+    pub max_chart_spread_pct: Decimal,
+
     // --- Noise control ---
     pub hysteresis_step_pct: Decimal,
     pub min_signal_lifetime_ms: u64,
@@ -105,6 +112,7 @@ impl Default for ClientConfig {
             min_spike_z: dec_lit("3"),
             max_spread_duration_ms: 300_000,
             min_dynamics_samples: 20,
+            max_chart_spread_pct: dec_lit("0.50"),
             hysteresis_step_pct: dec_lit("0.005"),
             min_signal_lifetime_ms: 1500,
             cooldown_ms: 2000,

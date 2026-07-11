@@ -11,9 +11,19 @@ use axum::Router;
 use domain::Instrument;
 use market_state::MarketState;
 use screener::{ClientConfig, TransferOracle};
+use spread_tape::SpreadTape;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use universe::UniverseStore;
+
+/// Chart/watch limits for a session.
+#[derive(Clone, Copy)]
+pub struct ChartParams {
+    /// Largest backfill window a client may request.
+    pub max_window_ms: u64,
+    /// Max concurrent watches per WS session.
+    pub max_watches: usize,
+}
 
 /// Shared, cheaply-cloneable application state handed to every handler.
 #[derive(Clone)]
@@ -21,6 +31,8 @@ pub struct AppState {
     pub market: Arc<MarketState>,
     pub oracle: Arc<dyn TransferOracle>,
     pub universe: Arc<UniverseStore>,
+    pub tape: Arc<SpreadTape>,
+    pub chart: ChartParams,
     /// Fan-out of "this instrument's market state changed" notifications. WS
     /// sessions subscribe; lag is tolerated (natural coalescing).
     pub events: broadcast::Sender<Instrument>,
@@ -38,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(rest::metrics))
         .route("/summary", get(rest::summary))
         .route("/instruments", get(rest::instruments))
+        .route("/spread/history", get(rest::spread_history))
         .route("/config/validate", post(rest::validate_config))
         .route("/ws", get(ws::ws_handler))
         .with_state(state)

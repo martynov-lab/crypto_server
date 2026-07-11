@@ -25,6 +25,7 @@ endpoints. Everything here is derived from the running server
 | Prometheus metrics | GET | `/metrics` |
 | Current best spread per instrument | GET | `/summary` |
 | Traded-instrument catalog (coins × venues) | GET | `/instruments` |
+| Spread chart history (fallback) | GET | `/spread/history?base=…&quote=…&window_ms=…` |
 | Validate a config without subscribing | POST | `/config/validate` |
 
 Local default host: `127.0.0.1:8080` (see `config/default.toml`).
@@ -127,6 +128,71 @@ Send another `subscribe` at any time to change filters. The server rebuilds the
 session's screening engine (hysteresis/lifetime state resets) and returns a fresh
 `subscribed` ack.
 
+### 2.45 Live spread chart (watch stream)
+
+Independent of `subscribe`: opening a coin's chart streams that instrument's
+**raw** spread — sampled at a fixed cadence, **not** deduplicated/hysteresis'd —
+so it draws a continuous line. Runs over the same `/ws`. Up to **3 concurrent
+watches** per session.
+
+**Start watching** (client → server):
+```json
+{ "type": "watch",
+  "instrument": { "base": "ARB", "quote": "USDT", "kind": "perp" },
+  "window_ms": 900000 }
+```
+`window_ms` (optional, default 900000, clamped to the server cap) is how much
+history to backfill. `resolution_ms` may be sent but the server picks the actual
+cadence and echoes it.
+
+**Backfill** (server → client, once) fills the window instantly:
+```json
+{ "type": "watch_snapshot",
+  "instrument": { "base": "ARB", "quote": "USDT", "kind": "perp" },
+  "resolution_ms": 1000, "window_ms": 900000,
+  "points": [ { "ts_ms": 1752230400000, "net_pct": "0.0031", "baseline_pct": "0.0030",
+               "buy_exchange": "mexc", "sell_exchange": "kucoin",
+               "executable_notional": "2000", "capped_by_depth": false } ] }
+```
+
+**Live ticks** (server → client, one per `resolution_ms`):
+```json
+{ "type": "spread_tick",
+  "instrument": { "base": "ARB", "quote": "USDT", "kind": "perp" },
+  "point": { "ts_ms": 1752230402000, "net_pct": "0.0289", "baseline_pct": "0.0031",
+             "buy_exchange": "mexc", "sell_exchange": "kucoin",
+             "executable_notional": "2000", "capped_by_depth": false } }
+```
+Append each `point` to the line and drop points older than `window_ms`.
+
+**Point fields:** `ts_ms` (X axis), `net_pct` (primary line, net of default
+fees), `baseline_pct` (reference band = rolling median), `gross_pct` (optional),
+`buy_exchange`/`sell_exchange` (which venues form the spread *right now* — can
+change), `executable_notional` + `capped_by_depth` (**entry quality**: real depth
+vs mirage — `capped_by_depth: true` means the book can't supply full size).
+
+**Stop watching:**
+```json
+{ "type": "unwatch", "instrument": { "base": "ARB", "quote": "USDT", "kind": "perp" } }
+```
+The server also drops all watches on socket close. **`subscribe`/reconfigure does
+NOT cancel watches** — they're independent.
+
+**Errors:** an instrument with < 2 venues (or the watch cap exceeded) gets a
+one-shot `{ "type": "error", "message": "no live spread for ARB/USDT" }` and no
+stream starts.
+
+**Anomaly filtering (two layers).** A server-global cap drops obvious data
+errors (wrong-token / stale-quote spikes) from the shared tape and dynamics for
+everyone. On top of that, each client can tighten its own chart via
+`max_chart_spread_pct` in its `ClientConfig` — backfill points and live ticks
+whose `abs(net_pct)` exceeds it are not delivered to that client. Send a new
+`subscribe` then re-`watch` to change it (watches capture the cap at watch time).
+
+**REST fallback:** `GET /spread/history?base=ARB&quote=USDT&window_ms=900000`
+returns `{ instrument, resolution_ms, window_ms, points[] }` (same point shape)
+for a cold render without an open socket.
+
 ### 2.5 Reconnect
 
 On socket close, reconnect with exponential backoff + jitter and re-send
@@ -135,6 +201,9 @@ coalesces to the latest state per instrument when a client lags, so the client
 should render the newest event per instrument and not assume every tick arrives.
 
 ## 3. `ClientConfig` reference (all fields optional on subscribe)
+
+> For end-user-facing tooltips/help text (detailed, in Russian), see
+> [CLIENT_SETTINGS_REFERENCE.md](CLIENT_SETTINGS_REFERENCE.md).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -161,6 +230,7 @@ should render the newest event per instrument and not assume every tick arrives.
 | `min_spike_z` | decimal-str | `"3"` | Require current spread ≥ this many stddevs above its mean |
 | `max_spread_duration_ms` | int | `300000` | Reject spreads that stay wide longer than this |
 | `min_dynamics_samples` | int | `20` | Warmup before dynamics filters apply |
+| `max_chart_spread_pct` | decimal-str | `"0.50"` | Chart anomaly cutoff: watch backfill/ticks whose abs(net_pct) exceeds this are dropped for this client (wrong-token / stale-quote data errors) |
 | `hysteresis_step_pct` | decimal-str | `"0.005"` | Re-alert only if spread widens this much |
 | `min_signal_lifetime_ms` | int | `1500` | Suppress until opportunity persists this long |
 | `cooldown_ms` | int | `2000` | Min gap between emits per instrument |
@@ -189,6 +259,11 @@ without holding a WS open.
 - [ ] Sort/highlight events by `quality_score`, and show the `dynamics` block
       (baseline vs current, z-score, episode age) so the user can see *why* a
       coin is a good arb candidate.
+- [ ] Coin detail screen with a **live spread chart**: on open send `watch`,
+      render `watch_snapshot` (net line + baseline band), append each
+      `spread_tick`, trim to `window_ms`; on close send `unwatch`. Mark points
+      where `capped_by_depth` flips (mirage vs real entry). Re-send `watch` after
+      a reconnect (watches are per-connection and survive `subscribe`).
 - [ ] **Decimal-safe parsing** for every price/ratio field (no floats for money).
 - [ ] A config/filters UI mapping 1:1 to `ClientConfig` — the 2–20% band,
       `target_notional_q`, and (later) volume/OI filters are the key knobs.

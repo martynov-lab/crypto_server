@@ -1,6 +1,7 @@
 //! Layered configuration: `config/default.toml` overlaid by `ARB__*` env vars.
 
 use config::{Config, Environment, File};
+use domain::Decimal;
 use screener::ClientConfig;
 use serde::Deserialize;
 
@@ -9,7 +10,37 @@ pub struct Settings {
     pub server: ServerCfg,
     pub ingest: IngestCfg,
     pub transfer: TransferCfg,
+    #[serde(default)]
+    pub chart: ChartCfg,
     pub default_client: ClientConfig,
+}
+
+/// Real-time spread-chart sampling and watch limits.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ChartCfg {
+    /// Fixed sampling cadence for the raw spread tape.
+    pub resolution_ms: u64,
+    /// Ring-buffer retention per instrument.
+    pub window_ms: u64,
+    /// Max concurrent watches per WS session.
+    pub max_watches: usize,
+    /// Global hard anomaly cap: samples with `|net_pct|` above this are treated
+    /// as data errors and dropped from BOTH the shared tape and the dynamics
+    /// history (protects every client's chart + baseline/z-score). Set well
+    /// above the legit alert band (e.g. 0.50 = 50%).
+    pub sanity_max_spread_pct: Decimal,
+}
+
+impl Default for ChartCfg {
+    fn default() -> Self {
+        ChartCfg {
+            resolution_ms: 1000,
+            window_ms: 1_800_000, // 30 min
+            max_watches: 3,
+            sanity_max_spread_pct: Decimal::new(50, 2), // 0.50
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

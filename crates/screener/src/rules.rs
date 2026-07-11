@@ -243,17 +243,25 @@ fn transfer_ok(
     Ok(())
 }
 
-/// The best raw net spread across a snapshot, ignoring all filters — used by the
-/// REST `/summary` endpoint. Returns `(buy, sell, net_pct)`.
-pub fn best_raw_net(
+/// The best raw executable spread across a snapshot, ignoring all alert filters
+/// (band/dynamics/transfer). This is the *unfiltered* spread that drives the
+/// chart and the rolling dynamics — computed with the client/default fees.
+///
+/// `ts_ms` is stamped onto the returned point. Returns `None` when fewer than two
+/// enabled venues have a usable book.
+pub fn best_spread_point(
     snapshot: &InstrumentSnapshot,
     cfg: &ClientConfig,
-) -> Option<(ExchangeId, ExchangeId, Decimal)> {
+    ts_ms: i64,
+) -> Option<domain::SpreadPoint> {
     let quotes: Vec<_> = snapshot
         .usable()
         .filter(|q| cfg.includes(q.exchange))
         .collect();
-    let mut best: Option<(ExchangeId, ExchangeId, Decimal)> = None;
+    if quotes.len() < 2 {
+        return None;
+    }
+    let mut best: Option<(ExchangeId, ExchangeId, ExecSpread)> = None;
     for (i, buy) in quotes.iter().enumerate() {
         for (j, sell) in quotes.iter().enumerate() {
             if i == j || buy.exchange == sell.exchange {
@@ -266,11 +274,31 @@ pub fn best_raw_net(
                 cfg.taker(buy.exchange),
                 cfg.taker(sell.exchange),
             ) {
-                if best.map_or(true, |(_, _, n)| es.net_pct > n) {
-                    best = Some((buy.exchange, sell.exchange, es.net_pct));
+                if best.as_ref().map_or(true, |(_, _, b)| es.net_pct > b.net_pct) {
+                    best = Some((buy.exchange, sell.exchange, es));
                 }
             }
         }
     }
-    best
+    let (buy_ex, sell_ex, es) = best?;
+    Some(domain::SpreadPoint {
+        ts_ms,
+        net_pct: es.net_pct,
+        gross_pct: es.gross_pct,
+        baseline_pct: snapshot.stats.as_ref().map(|s| s.baseline_pct),
+        buy_exchange: buy_ex,
+        sell_exchange: sell_ex,
+        executable_notional: es.executable_notional,
+        capped_by_depth: es.capped_by_depth,
+    })
+}
+
+/// The best raw net spread across a snapshot — used by the REST `/summary`
+/// endpoint. Returns `(buy, sell, net_pct)`.
+pub fn best_raw_net(
+    snapshot: &InstrumentSnapshot,
+    cfg: &ClientConfig,
+) -> Option<(ExchangeId, ExchangeId, Decimal)> {
+    best_spread_point(snapshot, cfg, 0)
+        .map(|p| (p.buy_exchange, p.sell_exchange, p.net_pct))
 }

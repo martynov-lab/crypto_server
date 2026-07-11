@@ -32,6 +32,18 @@ initial_backoff_ms = 500
 max_backoff_ms = 30000
 jitter_ms = 400
 
+[chart]
+# Real-time per-instrument spread chart (watch stream). The server samples every
+# screened instrument's raw spread at this cadence into a ring buffer, decoupled
+# from the alert engine.
+resolution_ms = 1000
+window_ms = 1800000     # 30 min ring buffer retained per instrument
+max_watches = 3         # max concurrent chart streams per WS session
+# Global anomaly cutoff: samples with |net_pct| above this are dropped from the
+# shared tape AND the dynamics history (wrong-token / stale-quote data errors).
+# Set well above the legit alert band; clients can tighten via max_chart_spread_pct.
+sanity_max_spread_pct = "0.50"
+
 [transfer]
 # Poll each exchange's public currency/coin-info endpoint for deposit/withdraw status.
 enabled = true
@@ -79,6 +91,7 @@ max_baseline_spread_pct = "0.01"  # reject coins whose median spread is persiste
 min_spike_z = "3"                 # current spread must be >=3 stddevs above its own mean
 max_spread_duration_ms = 300000   # reject spreads that stay wide > 5 min (trap)
 min_dynamics_samples = 20         # warmup before dynamics filters apply
+max_chart_spread_pct = "0.50"     # client-side chart anomaly cutoff (drops |net| above this from the watch stream)
 
 # Noise control.
 hysteresis_step_pct = "0.005"     # re-alert only when spread widens 0.5% past prior peak

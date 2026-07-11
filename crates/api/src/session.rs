@@ -1,6 +1,6 @@
 //! WS protocol message types exchanged with clients.
 
-use domain::ExchangeId;
+use domain::{ExchangeId, Instrument, SpreadPoint};
 use screener::{ClientConfig, ScreenerEvent};
 use serde::{Deserialize, Serialize};
 use universe::UniverseStore;
@@ -44,6 +44,17 @@ pub enum ClientMessage {
         #[serde(default)]
         config: Option<ClientConfig>,
     },
+    /// Start streaming an instrument's raw spread for the live chart. Independent
+    /// of `subscribe`; the server backfills then pushes ticks.
+    Watch {
+        instrument: Instrument,
+        #[serde(default)]
+        window_ms: Option<u64>,
+        #[serde(default)]
+        resolution_ms: Option<u64>,
+    },
+    /// Stop streaming an instrument's spread.
+    Unwatch { instrument: Instrument },
     /// Client keepalive.
     Ping,
 }
@@ -59,6 +70,18 @@ pub enum ServerMessage {
     Universe { instruments: Vec<CatalogRow> },
     /// A screening signal.
     Event(ScreenerEvent),
+    /// One-shot backfill of the rolling window right after `watch`.
+    WatchSnapshot {
+        instrument: Instrument,
+        resolution_ms: u64,
+        window_ms: u64,
+        points: Vec<SpreadPoint>,
+    },
+    /// A live raw-spread sample for a watched instrument.
+    SpreadTick {
+        instrument: Instrument,
+        point: SpreadPoint,
+    },
     /// Server keepalive response.
     Pong,
     /// A protocol/auth error; the connection may be closed after.
