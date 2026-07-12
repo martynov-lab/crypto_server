@@ -4,7 +4,14 @@
       "PowerShell($env:PATH = \"$env:USERPROFILE\\\\.cargo\\\\bin;$env:PATH\"; cargo test --workspace 2>&1 | Select-Object -Last 40)",
       "PowerShell($env:PATH = \"$env:USERPROFILE\\\\.cargo\\\\bin;$env:PATH\"; cargo test --workspace 2>&1 | Select-String -Pattern 'test result|FAILED|failed|error\\\\[' | Select-Object -First 40)",
       "PowerShell($env:PATH = \"$env:USERPROFILE\\\\.cargo\\\\bin;$env:PATH\"; cargo test -p server 2>&1 | Select-String -Pattern 'test |test result|error|warning: unused' | Select-Object -First 20)",
-      "PowerShell($env:PATH = \"$env:USERPROFILE\\\\.cargo\\\\bin;$env:PATH\"; cargo test --workspace 2>&1 | Select-String -Pattern 'error|FAILED|panicked|test result: FAILED|failures' | Select-Object -First 20; cargo test --workspace 2>&1 | Select-String -Pattern 'test result' | Measure-Object | Select-Object -ExpandProperty Count)"
+      "PowerShell($env:PATH = \"$env:USERPROFILE\\\\.cargo\\\\bin;$env:PATH\"; cargo test --workspace 2>&1 | Select-String -Pattern 'error|FAILED|panicked|test result: FAILED|failures' | Select-Object -First 20; cargo test --workspace 2>&1 | Select-String -Pattern 'test result' | Measure-Object | Select-Object -ExpandProperty Count)",
+      "Read(//c/Users/arovit/Projects/crypto_position/packages/core/**)",
+      "Read(//c/Users/arovit/Projects/crypto_position/**)",
+      "Read(//c/Users/arovit/Projects/crypto_position/lib/src/**)",
+      "Read(//c/Users/arovit/Projects/crypto_position/lib/src/presentation/screener/widgets/**)",
+      "Read(//c/Users/arovit/Projects/crypto_position/packages/screener/lib/src/models/**)",
+      "Read(//c/Users/arovit/Projects/crypto_position/packages/screener/lib/src/**)",
+      "PowerShell($env:PATH = \"$env:USERPROFILE\\\\.cargo\\\\bin;$env:PATH\"; cargo test --workspace 2>&1 | Select-String -Pattern 'error|warning: unused|FAILED|panicked|failures:' | Select-Object -First 20)"
     ]
   }
 }

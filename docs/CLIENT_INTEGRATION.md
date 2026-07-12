@@ -298,6 +298,13 @@ Array, highest net spread first:
 `coverage` = number of venues with a usable book. Use this for a dashboard/table
 without holding a WS open.
 
+Rows are filtered by the **server default config's** static filters: symbol
+allow/deny, market pair, the net-spread band, and the 24h volume band (so ghost
+spreads and server-denied coins never appear). Dynamics/transfer/hysteresis are
+not applied. Note this endpoint knows nothing about a client's own WS config —
+if the client uses `/summary` as a fallback view, it should additionally filter
+the rows with its local config (e.g. its own `deny_symbols`).
+
 ## 5. Client TODO checklist
 
 - [ ] WS client with auto-reconnect (exp backoff + jitter) and app-level ping.

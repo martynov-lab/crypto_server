@@ -304,12 +304,146 @@ pub fn best_spread_point(
     })
 }
 
-/// The best raw net spread across a snapshot — used by the REST `/summary`
-/// endpoint. Returns `(buy, sell, net_pct)`.
+/// The best raw net spread across a snapshot, ignoring all filters. Returns
+/// `(buy, sell, net_pct)`.
 pub fn best_raw_net(
     snapshot: &InstrumentSnapshot,
     cfg: &ClientConfig,
 ) -> Option<(ExchangeId, ExchangeId, Decimal)> {
     best_spread_point(snapshot, cfg, 0)
         .map(|p| (p.buy_exchange, p.sell_exchange, p.net_pct))
+}
+
+/// Best spread for the REST `/summary` snapshot, with the config's *static*
+/// filters applied: symbol allow/deny, market pair, the net-spread band, and
+/// the 24h volume band. Dynamics, transferability, and hysteresis are
+/// deliberately skipped — this is a cold-start dashboard row, not an alert —
+/// but denied coins and ghost spreads must not leak into the view either.
+pub fn summary_row(
+    snapshot: &InstrumentSnapshot,
+    cfg: &ClientConfig,
+) -> Option<(ExchangeId, ExchangeId, Decimal)> {
+    if !cfg.allows_symbol(&snapshot.instrument.base) {
+        return None;
+    }
+    let kind = snapshot.instrument.kind;
+    if !cfg.allows_market_pair(kind, kind) {
+        return None;
+    }
+    let (buy, sell, net) = best_raw_net(snapshot, cfg)?;
+    if net < cfg.min_net_spread_pct || net > cfg.max_net_spread_pct {
+        return None;
+    }
+    // Volume band against the chosen legs (skipped when neither reports it).
+    let leg_vol = |ex: ExchangeId| {
+        snapshot
+            .usable()
+            .find(|q| q.exchange == ex)
+            .and_then(|q| q.quote_volume_24h)
+    };
+    if let Some(vol) = max_opt(leg_vol(buy), leg_vol(sell)) {
+        if cfg.min_24h_quote_volume > Decimal::ZERO && vol < cfg.min_24h_quote_volume {
+            return None;
+        }
+        if let Some(max_vol) = cfg.max_24h_quote_volume {
+            if vol > max_vol {
+                return None;
+            }
+        }
+    }
+    Some((buy, sell, net))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::{BookLevel, Instrument, TopBook};
+    use market_state::InstrumentSnapshot;
+    use rust_decimal_macros::dec;
+    use std::time::Instant;
+
+    fn book(bid: Decimal, ask: Decimal) -> TopBook {
+        TopBook {
+            bids: vec![BookLevel::new(bid, dec!(1000))],
+            asks: vec![BookLevel::new(ask, dec!(1000))],
+            recv_ts: Instant::now(),
+            exch_ts: None,
+        }
+    }
+
+    fn quote(ex: ExchangeId, bid: Decimal, ask: Decimal, vol: Option<Decimal>) -> ExchangeQuote {
+        ExchangeQuote {
+            exchange: ex,
+            book: book(bid, ask),
+            funding: None,
+            quote_volume_24h: vol,
+            open_interest: None,
+            stale: false,
+            valid: true,
+        }
+    }
+
+    /// buy on Bybit at `cheap_ask`, sell on OKX at `rich_bid`.
+    fn snapshot(base: &str, cheap_ask: Decimal, rich_bid: Decimal) -> InstrumentSnapshot {
+        InstrumentSnapshot {
+            instrument: Instrument::perp(base, "USDT"),
+            quotes: vec![
+                quote(ExchangeId::Bybit, cheap_ask - dec!(1), cheap_ask, Some(dec!(150000))),
+                quote(ExchangeId::Okx, rich_bid, rich_bid + dec!(1), None),
+            ],
+            stats: None,
+        }
+    }
+
+    fn cfg() -> ClientConfig {
+        ClientConfig::default() // band 0.6%..25%, volume band 100k..200k
+    }
+
+    #[test]
+    fn summary_row_passes_in_band_spread() {
+        // buy 100, sell 106 => ~6% gross, inside the band; volume 150k in band.
+        let row = summary_row(&snapshot("XYZ", dec!(100), dec!(106)), &cfg());
+        let (buy, sell, net) = row.expect("in-band row");
+        assert_eq!(buy, ExchangeId::Bybit);
+        assert_eq!(sell, ExchangeId::Okx);
+        assert!(net > dec!(0.05) && net < dec!(0.07));
+    }
+
+    #[test]
+    fn summary_row_drops_ghost_spread() {
+        // buy 100, sell 56770 => the "56669%" ghost; must not leak into /summary.
+        assert!(summary_row(&snapshot("BB", dec!(100), dec!(56770)), &cfg()).is_none());
+    }
+
+    #[test]
+    fn summary_row_drops_below_min_spread() {
+        // buy 100, sell 100.2 => ~0.08% net, below the 0.6% floor.
+        assert!(summary_row(&snapshot("XYZ", dec!(100), dec!(100.2)), &cfg()).is_none());
+    }
+
+    #[test]
+    fn summary_row_respects_deny_list() {
+        let mut c = cfg();
+        c.deny_symbols = vec!["bb".into()]; // case-insensitive
+        assert!(summary_row(&snapshot("BB", dec!(100), dec!(106)), &c).is_none());
+        assert!(summary_row(&snapshot("XYZ", dec!(100), dec!(106)), &c).is_some());
+    }
+
+    #[test]
+    fn summary_row_respects_volume_band() {
+        let mut snap = snapshot("XYZ", dec!(100), dec!(106));
+        snap.quotes[0].quote_volume_24h = Some(dec!(900000)); // above 200k ceiling
+        assert!(summary_row(&snap, &cfg()).is_none());
+        snap.quotes[0].quote_volume_24h = Some(dec!(50000)); // below 100k floor
+        assert!(summary_row(&snap, &cfg()).is_none());
+        snap.quotes[0].quote_volume_24h = None; // unknown on both legs => skipped
+        assert!(summary_row(&snap, &cfg()).is_some());
+    }
+
+    #[test]
+    fn summary_row_respects_market_pairs() {
+        let mut c = cfg();
+        c.market_pairs = vec![crate::config::MarketPair::SPOT_SPOT];
+        assert!(summary_row(&snapshot("XYZ", dec!(100), dec!(106)), &c).is_none());
+    }
 }

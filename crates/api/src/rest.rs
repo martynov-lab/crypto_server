@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use domain::{Decimal, ExchangeId};
-use screener::{best_pair, best_raw_net, chart_point, ClientConfig};
+use screener::{best_pair, chart_point, summary_row, ClientConfig};
 use serde::Serialize;
 use std::time::Instant;
 
@@ -36,15 +36,18 @@ struct SummaryRow {
     coverage: usize,
 }
 
-/// Current best net spread per instrument, using the server default config.
-/// Useful for a dashboard snapshot without opening a WS.
+/// Current best net spread per instrument, using the server default config's
+/// static filters (symbol allow/deny, market pair, spread band, volume band) —
+/// so denied coins and ghost spreads don't leak into the cold-start snapshot.
+/// Dynamics/transfer/hysteresis are not applied. Useful without opening a WS;
+/// per-client filters only apply on the WS signal stream.
 pub async fn summary(State(state): State<AppState>) -> impl IntoResponse {
     let cfg: &ClientConfig = &state.default_cfg;
     let now = Instant::now();
     let mut rows = Vec::new();
     for instrument in state.market.instruments() {
         let snap = state.market.snapshot(&instrument, now);
-        if let Some((buy, sell, net)) = best_raw_net(&snap, cfg) {
+        if let Some((buy, sell, net)) = summary_row(&snap, cfg) {
             rows.push(SummaryRow {
                 instrument: format!("{}/{}", instrument.base, instrument.quote),
                 buy_exchange: buy,

@@ -22,7 +22,8 @@ pub use chart::{best_pair, chart_point, venue_sample};
 pub use config::{ClientConfig, MarketPair};
 pub use funding::FundingSignal;
 pub use rules::{
-    best_raw_net, best_spread_point, evaluate, Evaluation, NoTransferInfo, TransferOracle,
+    best_raw_net, best_spread_point, evaluate, summary_row, Evaluation, NoTransferInfo,
+    TransferOracle,
 };
 
 /// A signal pushed to a client.
