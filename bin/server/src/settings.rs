@@ -57,6 +57,11 @@ pub struct IngestCfg {
     pub staleness_ms: u64,
     #[serde(default)]
     pub auto_discover: bool,
+    /// When set, discovery takes this exchange's coin list as the source and
+    /// screens those bases against the other venues (e.g. "bybit"). Unset =
+    /// screen everything listed on >= min_venues exchanges.
+    #[serde(default)]
+    pub anchor_exchange: Option<String>,
     #[serde(default = "default_min_venues")]
     pub min_venues: usize,
     #[serde(default = "default_max_symbols")]
@@ -105,5 +110,28 @@ impl Settings {
             )
             .build()?;
         Ok(cfg.try_deserialize()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use screener::MarketPair;
+
+    /// The shipped config/default.toml must deserialize and validate.
+    #[test]
+    fn default_toml_parses_and_validates() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/default");
+        let cfg = Config::builder()
+            .add_source(File::with_name(path))
+            .build()
+            .expect("read config/default.toml");
+        let settings: Settings = cfg.try_deserialize().expect("deserialize Settings");
+        settings
+            .default_client
+            .validate()
+            .expect("default_client validates");
+        assert_eq!(settings.default_client.market_pairs, vec![MarketPair::PERP_PERP]);
+        assert!(settings.default_client.max_24h_quote_volume.is_some());
     }
 }

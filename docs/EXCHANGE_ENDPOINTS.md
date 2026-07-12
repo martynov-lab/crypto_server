@@ -26,12 +26,14 @@ Keepalive frames: Bybit `{"op":"ping"}`; OKX/Bitget literal `ping`; MEXC
 `{"method":"server.ping",...}`.
 
 ### KuCoin bootstrap
+
 `POST https://api-futures.kucoin.com/api/v1/bullet-public` →
 `{ data: { token, instanceServers:[{ endpoint }] } }`; connect to
 `{endpoint}?token={token}&connectId=arb-screener`. Implemented in
 `Kucoin::resolve_ws_url`.
 
 ### Known imprecisions
+
 - **Gate** uses `book_ticker` (best bid/ask only); sizes are in *contracts*, so
   executable notional is approximate. For real depth switch to
   `futures.order_book`/`futures.order_book_update` (snapshot+delta) and apply the

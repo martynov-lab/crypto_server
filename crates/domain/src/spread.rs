@@ -125,6 +125,8 @@ pub enum SpreadReason {
     NoCommonNetwork,
     StaleBook,
     BelowMinVolume,
+    /// 24h volume above the client's ceiling — outside the low-cap band.
+    AboveMaxVolume,
     BelowMinOpenInterest,
     /// Baseline spread is persistently wide — structural break, not opportunity.
     PersistentWide,

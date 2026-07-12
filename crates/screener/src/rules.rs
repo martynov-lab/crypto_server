@@ -49,6 +49,14 @@ pub fn evaluate(
     if !cfg.allows_symbol(&snapshot.instrument.base) {
         return None;
     }
+    // Market-kind filter. A snapshot covers one instrument, so both legs share
+    // its kind (perp/perp today, spot/spot once spot ingestion lands). Mixed
+    // pairs (spot/perp) will need cross-instrument snapshots and are checked
+    // here the same way when that lands.
+    let kind = snapshot.instrument.kind;
+    if !cfg.allows_market_pair(kind, kind) {
+        return None;
+    }
 
     // Usable, client-enabled quotes only.
     let quotes: Vec<_> = snapshot
@@ -143,12 +151,15 @@ fn classify(
     if es.executable_notional < cfg.min_executable_notional {
         return SpreadReason::InsufficientDepth;
     }
-    // Liquidity floors. Applied against the higher of the two legs' reported
+    // Liquidity band. Applied against the higher of the two legs' reported
     // figures; skipped when neither venue reports the metric (unknown).
-    if cfg.min_24h_quote_volume > Decimal::ZERO {
-        if let Some(vol) = max_opt(buy_q.quote_volume_24h, sell_q.quote_volume_24h) {
-            if vol < cfg.min_24h_quote_volume {
-                return SpreadReason::BelowMinVolume;
+    if let Some(vol) = max_opt(buy_q.quote_volume_24h, sell_q.quote_volume_24h) {
+        if cfg.min_24h_quote_volume > Decimal::ZERO && vol < cfg.min_24h_quote_volume {
+            return SpreadReason::BelowMinVolume;
+        }
+        if let Some(max_vol) = cfg.max_24h_quote_volume {
+            if vol > max_vol {
+                return SpreadReason::AboveMaxVolume;
             }
         }
     }

@@ -23,10 +23,11 @@ use transfer_status::{run_poller, PollConfig, TransferStore};
 use universe::poller::refresh_once;
 use universe::{DiscoveryConfig, UniverseStore};
 
-/// Build per-exchange subscription lists. With `auto_discover`, screen every base
-/// listed on >= `min_venues` venues (capped at `max_symbols`, most-covered first),
-/// each assigned only to the venues that actually list it. Otherwise use the
-/// static `symbols` list, still filtered by discovered listings when available.
+/// Build per-exchange subscription lists. With `auto_discover`, screen the
+/// discovered bases (anchored to `anchor_exchange`'s coin list when set, else
+/// everything on >= `min_venues` venues; capped at `max_symbols`, most-covered
+/// first), each assigned only to the venues that actually list it. Otherwise
+/// use the static `symbols` list, still filtered by discovered listings.
 fn build_symbol_map(
     settings: &Settings,
     enabled: &[ExchangeId],
@@ -37,7 +38,7 @@ fn build_symbol_map(
     let listed: HashMap<String, Vec<ExchangeId>> = universe.catalog().into_iter().collect();
 
     let bases: Vec<String> = if settings.ingest.auto_discover && !universe.is_empty() {
-        let mut b = universe.screenable(settings.ingest.min_venues);
+        let mut b = discovered_bases(settings, enabled, universe);
         b.truncate(settings.ingest.max_symbols);
         b
     } else {
@@ -65,6 +66,40 @@ fn build_symbol_map(
         }
     }
     map
+}
+
+/// Discovered screening list: anchored to one exchange's coin list when
+/// `ingest.anchor_exchange` is set (e.g. take Bybit's coins and screen their
+/// spread on the other venues), otherwise everything on >= min_venues.
+/// Falls back to the unanchored list when the anchor is unusable (unknown id,
+/// not enabled, or its discovery fetch failed), so the screener never idles.
+fn discovered_bases(
+    settings: &Settings,
+    enabled: &[ExchangeId],
+    universe: &UniverseStore,
+) -> Vec<String> {
+    let unanchored = || universe.screenable(settings.ingest.min_venues);
+    let Some(raw) = settings.ingest.anchor_exchange.as_deref() else {
+        return unanchored();
+    };
+    let anchor = match ExchangeId::from_str(raw) {
+        Ok(id) if enabled.contains(&id) => id,
+        Ok(id) => {
+            warn!(anchor = %id, "anchor_exchange not in enabled exchanges; ignoring anchor");
+            return unanchored();
+        }
+        Err(e) => {
+            warn!(anchor = %raw, error = %e, "unknown anchor_exchange; ignoring anchor");
+            return unanchored();
+        }
+    };
+    let bases = universe.screenable_anchored(anchor, settings.ingest.min_venues);
+    if bases.is_empty() {
+        warn!(anchor = %anchor, "anchored universe is empty (discovery failed?); falling back");
+        return unanchored();
+    }
+    info!(anchor = %anchor, bases = bases.len(), "universe anchored to exchange coin list");
+    bases
 }
 
 #[tokio::main]

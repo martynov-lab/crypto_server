@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 pub use chart::{best_pair, chart_point, venue_sample};
-pub use config::ClientConfig;
+pub use config::{ClientConfig, MarketPair};
 pub use funding::FundingSignal;
 pub use rules::{
     best_raw_net, best_spread_point, evaluate, Evaluation, NoTransferInfo, TransferOracle,

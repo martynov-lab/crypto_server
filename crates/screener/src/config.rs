@@ -1,13 +1,35 @@
 //! `ClientConfig` — the per-client screening parameters sent over WS `Subscribe`.
 //! Field docs double as the parameter reference for the client app.
 
-use domain::{Decimal, ExchangeId, ALL_EXCHANGES};
+use domain::{Decimal, ExchangeId, MarketKind, ALL_EXCHANGES};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 
 /// Default taker fee used when a client doesn't specify one for a venue.
 pub const DEFAULT_TAKER_FEE_STR: &str = "0.0006";
+
+/// One market-kind combination the client wants screened: the kind of the
+/// buy (long) leg × the kind of the sell (short) leg. `perp`/`perp` is the
+/// classic futures/futures arb; mixed pairs (`spot`/`perp`, `perp`/`spot`)
+/// cover cash-and-carry style setups once spot ingestion is wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketPair {
+    pub buy: MarketKind,
+    pub sell: MarketKind,
+}
+
+impl MarketPair {
+    pub const fn new(buy: MarketKind, sell: MarketKind) -> Self {
+        MarketPair { buy, sell }
+    }
+
+    /// Futures/futures — the only pair the pipeline ingests today.
+    pub const PERP_PERP: MarketPair = MarketPair::new(MarketKind::Perp, MarketKind::Perp);
+    pub const SPOT_SPOT: MarketPair = MarketPair::new(MarketKind::Spot, MarketKind::Spot);
+    pub const SPOT_PERP: MarketPair = MarketPair::new(MarketKind::Spot, MarketKind::Perp);
+    pub const PERP_SPOT: MarketPair = MarketPair::new(MarketKind::Perp, MarketKind::Spot);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -21,13 +43,21 @@ pub struct ClientConfig {
     pub allow_symbols: Vec<String>,
     /// Base-asset deny list.
     pub deny_symbols: Vec<String>,
-    /// Drop markets below this 24h quote volume (USDT). Enforced once ticker
-    /// volume ingestion is wired; accepted now for forward compatibility.
+    /// Market-kind combinations to screen (buy leg × sell leg). Default:
+    /// perp/perp only. Spot legs are accepted now for forward compatibility
+    /// and take effect once spot ingestion is wired.
+    pub market_pairs: Vec<MarketPair>,
+    /// Drop markets below this 24h quote volume (USDT). Together with
+    /// `max_24h_quote_volume` this forms the volume band the client screens.
     pub min_24h_quote_volume: Decimal,
+    /// Drop markets above this 24h quote volume (USDT); `None` = no ceiling.
+    /// A low-cap band (e.g. 100k..200k) targets thin coins where spreads
+    /// actually persist, instead of hyper-liquid majors.
+    pub max_24h_quote_volume: Option<Decimal>,
     /// Optional perp open-interest floor (base units).
     pub min_open_interest: Option<Decimal>,
 
-    // --- Spread band (the 2%..20% control) ---
+    // --- Spread band (the 0.6%..25% control) ---
     pub min_net_spread_pct: Decimal,
     /// Caps ghost spreads (delisted/frozen/wrong-token) that masquerade as huge edges.
     pub max_net_spread_pct: Decimal,
@@ -90,10 +120,12 @@ impl Default for ClientConfig {
             quote: "USDT".to_string(),
             allow_symbols: vec![],
             deny_symbols: vec![],
-            min_24h_quote_volume: Decimal::ZERO,
+            market_pairs: vec![MarketPair::PERP_PERP],
+            min_24h_quote_volume: dec_lit("100000"),
+            max_24h_quote_volume: Some(dec_lit("200000")),
             min_open_interest: None,
-            min_net_spread_pct: dec_lit("0.02"),
-            max_net_spread_pct: dec_lit("0.20"),
+            min_net_spread_pct: dec_lit("0.006"),
+            max_net_spread_pct: dec_lit("0.25"),
             target_notional_q: dec_lit("2000"),
             min_executable_notional: dec_lit("500"),
             depth_levels_n: 20,
@@ -135,6 +167,11 @@ impl ClientConfig {
         self.exchanges.contains(&ex)
     }
 
+    /// Whether the client screens this buy-leg × sell-leg market combination.
+    pub fn allows_market_pair(&self, buy: MarketKind, sell: MarketKind) -> bool {
+        self.market_pairs.contains(&MarketPair::new(buy, sell))
+    }
+
     /// Whether a base asset passes the allow/deny lists.
     pub fn allows_symbol(&self, base: &str) -> bool {
         let base = base.to_uppercase();
@@ -151,6 +188,14 @@ impl ClientConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.exchanges.is_empty() {
             return Err("exchanges must not be empty".into());
+        }
+        if self.market_pairs.is_empty() {
+            return Err("market_pairs must not be empty".into());
+        }
+        if let Some(max_vol) = self.max_24h_quote_volume {
+            if max_vol < self.min_24h_quote_volume {
+                return Err("max_24h_quote_volume must be >= min_24h_quote_volume".into());
+            }
         }
         if self.min_net_spread_pct < Decimal::ZERO {
             return Err("min_net_spread_pct must be >= 0".into());
@@ -202,5 +247,38 @@ mod tests {
         cfg.max_net_spread_pct = dec!(0.01);
         cfg.min_net_spread_pct = dec!(0.02);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_catches_bad_volume_band() {
+        let mut cfg = ClientConfig::default();
+        cfg.min_24h_quote_volume = dec!(200000);
+        cfg.max_24h_quote_volume = Some(dec!(100000));
+        assert!(cfg.validate().is_err());
+        cfg.max_24h_quote_volume = None; // no ceiling is always fine
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn default_is_perp_perp_only() {
+        let cfg = ClientConfig::default();
+        assert!(cfg.allows_market_pair(MarketKind::Perp, MarketKind::Perp));
+        assert!(!cfg.allows_market_pair(MarketKind::Spot, MarketKind::Spot));
+        assert!(!cfg.allows_market_pair(MarketKind::Spot, MarketKind::Perp));
+    }
+
+    #[test]
+    fn validate_catches_empty_market_pairs() {
+        let mut cfg = ClientConfig::default();
+        cfg.market_pairs.clear();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn market_pair_serde_roundtrip() {
+        let j = serde_json::to_string(&MarketPair::SPOT_PERP).unwrap();
+        assert_eq!(j, r#"{"buy":"spot","sell":"perp"}"#);
+        let p: MarketPair = serde_json::from_str(&j).unwrap();
+        assert_eq!(p, MarketPair::SPOT_PERP);
     }
 }
