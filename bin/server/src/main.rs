@@ -261,6 +261,54 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Terminal signal logger: run the default screening config server-side and
+    // print each signal to the terminal, mirroring the per-session evaluation in
+    // the WS handler. Lets the operator see the same spread alerts a subscribed
+    // client would while setting the system up, before any client connects.
+    if settings.server.log_signals {
+        let market = market.clone();
+        let oracle: Arc<dyn screener::TransferOracle> = store.clone();
+        let engine = screener::ScreenerEngine::new((*default_cfg).clone());
+        let mut events_rx = events_tx.subscribe();
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            info!("terminal signal logger active (using default_client config)");
+            loop {
+                tokio::select! {
+                    recv = events_rx.recv() => match recv {
+                        Ok(instrument) => {
+                            let now = std::time::Instant::now();
+                            let ts_ms = chrono::Utc::now().timestamp_millis();
+                            let snap = market.snapshot(&instrument, now);
+                            if let Some(ev) = engine.on_instrument(&snap, oracle.as_ref(), now, ts_ms) {
+                                log_signal(&ev);
+                            }
+                        }
+                        // Fell behind the broadcast: rescan all instruments so a
+                        // live signal isn't missed (same recovery as WS sessions).
+                        Err(RecvError::Lagged(n)) => {
+                            warn!(missed = n, "signal logger lagged; rescanning");
+                            let now = std::time::Instant::now();
+                            let ts_ms = chrono::Utc::now().timestamp_millis();
+                            for instrument in market.instruments() {
+                                let snap = market.snapshot(&instrument, now);
+                                if let Some(ev) = engine.on_instrument(&snap, oracle.as_ref(), now, ts_ms) {
+                                    log_signal(&ev);
+                                }
+                            }
+                        }
+                        Err(RecvError::Closed) => break,
+                    },
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() { break; }
+                    }
+                }
+            }
+            info!("signal logger stopped");
+        });
+    }
+
     // Transfer-status poller.
     if settings.transfer.enabled {
         let exchanges = settings
@@ -326,6 +374,50 @@ async fn main() -> anyhow::Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Print a screener signal to the terminal in a compact, readable line, so the
+/// operator sees the same alert a subscribed client receives over WS.
+fn log_signal(ev: &screener::ScreenerEvent) {
+    use domain::Decimal;
+    let hundred = Decimal::from(100);
+    let pct = |d: Decimal| (d * hundred).round_dp(2);
+    let s = &ev.spread;
+
+    let funding = ev
+        .funding
+        .as_ref()
+        .map(|f| {
+            format!(
+                "  funding: long {} / short {} (+{}% APR)",
+                f.long_exchange,
+                f.short_exchange,
+                pct(f.diff_apr),
+            )
+        })
+        .unwrap_or_default();
+    let quality = ev
+        .quality_score
+        .map(|q| format!("  q={}", q.round_dp(0)))
+        .unwrap_or_default();
+    let depth = if s.capped_by_depth { "  [depth-capped]" } else { "" };
+
+    info!(
+        target: "signal",
+        "SIGNAL {}/{}  BUY {} @ {}  SELL {} @ {}  net +{}% (gross +{}%)  size ${}{}{}{}",
+        s.instrument.base,
+        s.instrument.quote,
+        s.buy_exchange,
+        s.vwap_buy.normalize(),
+        s.sell_exchange,
+        s.vwap_sell.normalize(),
+        pct(s.net_pct),
+        pct(s.gross_pct),
+        s.executable_notional.round_dp(0),
+        depth,
+        funding,
+        quality,
+    );
 }
 
 fn init_tracing() {

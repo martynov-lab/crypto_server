@@ -46,6 +46,15 @@ impl Default for ChartCfg {
 #[derive(Debug, Deserialize)]
 pub struct ServerCfg {
     pub bind: String,
+    /// Print every screening signal (evaluated with `default_client`) to the
+    /// terminal, so the operator sees the same spread alerts a subscribed client
+    /// would — handy while setting the system up before any client connects.
+    #[serde(default = "default_log_signals")]
+    pub log_signals: bool,
+}
+
+fn default_log_signals() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
