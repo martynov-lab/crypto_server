@@ -262,44 +262,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Terminal signal logger: run the default screening config server-side and
-    // print each signal to the terminal, mirroring the per-session evaluation in
-    // the WS handler. Lets the operator see the same spread alerts a subscribed
-    // client would while setting the system up, before any client connects.
+    // print each signal to the terminal, so the operator sees the same spread
+    // alerts a subscribed client would while setting the system up, before any
+    // client connects. Scans on a fixed timer (like the spread sampler) rather
+    // than chasing the high-rate market broadcast — the engine's own
+    // hysteresis/cooldown dedups across scans, and a timer can't fall behind.
     if settings.server.log_signals {
         let market = market.clone();
         let oracle: Arc<dyn screener::TransferOracle> = store.clone();
         let engine = screener::ScreenerEngine::new((*default_cfg).clone());
-        let mut events_rx = events_tx.subscribe();
         let mut shutdown_rx = shutdown_rx.clone();
+        let scan = Duration::from_millis(settings.chart.resolution_ms.max(500));
         tokio::spawn(async move {
-            use tokio::sync::broadcast::error::RecvError;
+            let mut timer = tokio::time::interval(scan);
             info!("terminal signal logger active (using default_client config)");
             loop {
                 tokio::select! {
-                    recv = events_rx.recv() => match recv {
-                        Ok(instrument) => {
-                            let now = std::time::Instant::now();
-                            let ts_ms = chrono::Utc::now().timestamp_millis();
+                    _ = timer.tick() => {
+                        let now = std::time::Instant::now();
+                        let ts_ms = chrono::Utc::now().timestamp_millis();
+                        for instrument in market.instruments() {
                             let snap = market.snapshot(&instrument, now);
                             if let Some(ev) = engine.on_instrument(&snap, oracle.as_ref(), now, ts_ms) {
                                 log_signal(&ev);
                             }
                         }
-                        // Fell behind the broadcast: rescan all instruments so a
-                        // live signal isn't missed (same recovery as WS sessions).
-                        Err(RecvError::Lagged(n)) => {
-                            warn!(missed = n, "signal logger lagged; rescanning");
-                            let now = std::time::Instant::now();
-                            let ts_ms = chrono::Utc::now().timestamp_millis();
-                            for instrument in market.instruments() {
-                                let snap = market.snapshot(&instrument, now);
-                                if let Some(ev) = engine.on_instrument(&snap, oracle.as_ref(), now, ts_ms) {
-                                    log_signal(&ev);
-                                }
-                            }
-                        }
-                        Err(RecvError::Closed) => break,
-                    },
+                    }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() { break; }
                     }
@@ -376,48 +364,60 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print a screener signal to the terminal in a compact, readable line, so the
-/// operator sees the same alert a subscribed client receives over WS.
+/// Print a screener signal to the terminal, mirroring the alert a subscribed
+/// client receives over WS. Reads like:
+/// `SNOW: лонг SNOWUSDT.P на Bybit, шорт SNOW_USDT на GateIoFutures — чистый
+///  спред 0,62% (без комиссий 0,72%)`.
 fn log_signal(ev: &screener::ScreenerEvent) {
-    use domain::Decimal;
-    let hundred = Decimal::from(100);
-    let pct = |d: Decimal| (d * hundred).round_dp(2);
     let s = &ev.spread;
-
-    let funding = ev
-        .funding
-        .as_ref()
-        .map(|f| {
-            format!(
-                "  funding: long {} / short {} (+{}% APR)",
-                f.long_exchange,
-                f.short_exchange,
-                pct(f.diff_apr),
-            )
-        })
-        .unwrap_or_default();
-    let quality = ev
-        .quality_score
-        .map(|q| format!("  q={}", q.round_dp(0)))
-        .unwrap_or_default();
-    let depth = if s.capped_by_depth { "  [depth-capped]" } else { "" };
-
+    // buy_exchange = lowest ask → the long leg; sell_exchange = highest bid → short.
     info!(
-        target: "signal",
-        "SIGNAL {}/{}  BUY {} @ {}  SELL {} @ {}  net +{}% (gross +{}%)  size ${}{}{}{}",
+        target: "signal!!!!!",
+        "{}: лонг {} на {}, шорт {} на {} — чистый спред {}% (без комиссий {}%)",
         s.instrument.base,
-        s.instrument.quote,
-        s.buy_exchange,
-        s.vwap_buy.normalize(),
-        s.sell_exchange,
-        s.vwap_sell.normalize(),
-        pct(s.net_pct),
-        pct(s.gross_pct),
-        s.executable_notional.round_dp(0),
-        depth,
-        funding,
-        quality,
+        venue_symbol(s.buy_exchange, &s.instrument),
+        venue_name(s.buy_exchange),
+        venue_symbol(s.sell_exchange, &s.instrument),
+        venue_name(s.sell_exchange),
+        ru_pct(s.net_pct),
+        ru_pct(s.gross_pct),
     );
+}
+
+/// Format a fraction (0.0062) as a Russian-locale percent string ("0,62").
+fn ru_pct(d: domain::Decimal) -> String {
+    (d * domain::Decimal::from(100))
+        .round_dp(2)
+        .normalize()
+        .to_string()
+        .replace('.', ",")
+}
+
+/// Human-facing exchange name for terminal output.
+fn venue_name(ex: ExchangeId) -> &'static str {
+    match ex {
+        ExchangeId::Bybit => "Bybit",
+        ExchangeId::Okx => "OKX",
+        ExchangeId::Mexc => "MEXC",
+        ExchangeId::Bitget => "Bitget",
+        ExchangeId::Gate => "GateIoFutures",
+        ExchangeId::Coinex => "CoinEx",
+        ExchangeId::Kucoin => "KuCoin",
+        ExchangeId::Phemex => "Phemex",
+    }
+}
+
+/// Exchange-native perp symbol for the instrument (best-effort, matches each
+/// venue's common convention, e.g. Bybit `SNOWUSDT.P`, Gate `SNOW_USDT`).
+fn venue_symbol(ex: ExchangeId, inst: &Instrument) -> String {
+    let (b, q) = (&inst.base, &inst.quote);
+    match ex {
+        ExchangeId::Bybit => format!("{b}{q}.P"),
+        ExchangeId::Okx => format!("{b}-{q}-SWAP"),
+        ExchangeId::Gate | ExchangeId::Mexc => format!("{b}_{q}"),
+        ExchangeId::Kucoin => format!("{b}{q}M"),
+        ExchangeId::Bitget | ExchangeId::Coinex | ExchangeId::Phemex => format!("{b}{q}"),
+    }
 }
 
 fn init_tracing() {
