@@ -114,7 +114,7 @@ impl MarketState {
             let (quote_volume_24h, open_interest) = self
                 .tickers
                 .get(&(*ex, inst.clone()))
-                .map(|t| t.clone())
+                .map(|t| *t)
                 .unwrap_or((None, None));
             quotes.push(ExchangeQuote {
                 exchange: *ex,

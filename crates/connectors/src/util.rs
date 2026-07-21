@@ -31,8 +31,8 @@ pub fn level_from_pair(pair: &Value) -> Option<BookLevel> {
 /// best-first (desc price); `asks` best-first (asc price). This defensively
 /// re-sorts in case the venue delivers unsorted partial books.
 pub fn finalize_sides(mut bids: Vec<BookLevel>, mut asks: Vec<BookLevel>, n: usize) -> (Vec<BookLevel>, Vec<BookLevel>) {
-    bids.sort_by(|a, b| b.price.cmp(&a.price));
-    asks.sort_by(|a, b| a.price.cmp(&b.price));
+    bids.sort_by_key(|b| std::cmp::Reverse(b.price));
+    asks.sort_by_key(|a| a.price);
     bids.truncate(n);
     asks.truncate(n);
     (bids, asks)

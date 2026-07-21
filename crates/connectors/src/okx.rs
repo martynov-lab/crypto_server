@@ -22,7 +22,7 @@ impl Okx {
     pub fn new(depth: usize) -> Self {
         // books5 delivers 5 levels; keep the configured depth as an upper bound.
         Okx {
-            depth: depth.min(5).max(1),
+            depth: depth.clamp(1, 5),
         }
     }
 }

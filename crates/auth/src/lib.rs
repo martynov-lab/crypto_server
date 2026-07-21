@@ -5,19 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum AuthPolicy {
     /// Accept any client (local development).
+    #[default]
     Open,
     /// Require an exact bearer token match.
     StaticToken { token: String },
-}
-
-impl Default for AuthPolicy {
-    fn default() -> Self {
-        AuthPolicy::Open
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
