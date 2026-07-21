@@ -1,0 +1,11 @@
+target/
+.git/
+.github/
+.vscode/
+.claude/
+docs/
+deploy/
+data/
+*.csv
+.env
+README.md

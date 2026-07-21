@@ -19,7 +19,8 @@
       "Bash(curl -s \"https://contract.mexc.com/api/v1/contract/detail\")",
       "PowerShell(Get-Process arb-screener -ErrorAction SilentlyContinue)",
       "PowerShell(Stop-Process -Force)",
-      "PowerShell(\"stopped\")"
+      "PowerShell(\"stopped\")",
+      "Bash(git config *)"
     ]
   }
 }

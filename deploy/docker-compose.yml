@@ -1,0 +1,38 @@
+# Runtime stack for the GCE VM. Lives in /opt/arb on the server together with
+# `.env` (secrets, 0600) — see docs/DEPLOY.md.
+services:
+  arb:
+    image: ${ARB_IMAGE:-ghcr.io/martynov-lab/crypto_server:latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Bind inside the container network; only Caddy is exposed publicly.
+      ARB__SERVER__BIND: "0.0.0.0:8080"
+      RUST_LOG: "${RUST_LOG:-info}"
+    # The VM has 1 GB RAM; cap the screener so an unexpected growth in the
+    # book/dynamics state cannot take the whole box (and Caddy) down with it.
+    mem_limit: 768m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: "${DOMAIN:?set DOMAIN in .env}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # certificates — must persist across restarts
+      - caddy_config:/config
+    depends_on: [arb]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  caddy_data:
+  caddy_config:

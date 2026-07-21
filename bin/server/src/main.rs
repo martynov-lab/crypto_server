@@ -356,7 +356,7 @@ async fn main() -> anyhow::Result<()> {
         },
         events: events_tx.clone(),
         default_cfg: default_cfg.clone(),
-        auth: Arc::new(AuthPolicy::default()),
+        auth: Arc::new(auth_policy()),
         metrics_render,
     };
     let app = api::router(state);
@@ -373,6 +373,22 @@ async fn main() -> anyhow::Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Client auth policy. `ARB_AUTH_TOKEN` (non-empty) requires that exact bearer
+/// token from every WS/REST client; unset means open, which is fine for a local
+/// bind but must never be the case on a public interface.
+fn auth_policy() -> AuthPolicy {
+    match std::env::var("ARB_AUTH_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => {
+            info!("client auth: static token");
+            AuthPolicy::StaticToken { token: t }
+        }
+        _ => {
+            warn!("ARB_AUTH_TOKEN unset — client auth is OPEN");
+            AuthPolicy::Open
+        }
+    }
 }
 
 /// Print a screener signal to the terminal, mirroring the alert a subscribed

@@ -1,0 +1,19 @@
+# Public edge: TLS termination (Let's Encrypt, automatic) + reverse proxy to the
+# screener. Provides the wss:// endpoint browser clients require.
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Operational endpoints are not for the public internet: /metrics exposes
+	# internals and /healthz is fine to leak but noisy. Only /healthz stays open
+	# so external uptime checks work.
+	@internal path /metrics /metrics/*
+	respond @internal 404
+
+	reverse_proxy arb:8080 {
+		# WS sessions are long-lived and mostly idle between spread events.
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}
