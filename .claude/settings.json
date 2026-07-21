@@ -11,7 +11,15 @@
       "Read(//c/Users/arovit/Projects/crypto_position/lib/src/presentation/screener/widgets/**)",
       "Read(//c/Users/arovit/Projects/crypto_position/packages/screener/lib/src/models/**)",
       "Read(//c/Users/arovit/Projects/crypto_position/packages/screener/lib/src/**)",
-      "PowerShell($env:PATH = \"$env:USERPROFILE\\\\.cargo\\\\bin;$env:PATH\"; cargo test --workspace 2>&1 | Select-String -Pattern 'error|warning: unused|FAILED|panicked|failures:' | Select-Object -First 20)"
+      "PowerShell($env:PATH = \"$env:USERPROFILE\\\\.cargo\\\\bin;$env:PATH\"; cargo test --workspace 2>&1 | Select-String -Pattern 'error|warning: unused|FAILED|panicked|failures:' | Select-Object -First 20)",
+      "Bash(curl -s \"https://api.gateio.ws/api/v4/futures/usdt/contracts\")",
+      "Bash(python -c ' *)",
+      "Bash(curl -s \"https://www.okx.com/api/v5/public/instruments?instType=SWAP\")",
+      "Bash(curl -s \"https://api-futures.kucoin.com/api/v1/contracts/active\")",
+      "Bash(curl -s \"https://contract.mexc.com/api/v1/contract/detail\")",
+      "PowerShell(Get-Process arb-screener -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force)",
+      "PowerShell(\"stopped\")"
     ]
   }
 }

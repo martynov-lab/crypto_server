@@ -32,14 +32,36 @@ Keepalive frames: Bybit `{"op":"ping"}`; OKX/Bitget literal `ping`; MEXC
 `{endpoint}?token={token}&connectId=arb-screener`. Implemented in
 `Kucoin::resolve_ws_url`.
 
+### Contract sizes (book quantity units)
+
+Several venues quote order-book quantities in **contracts**, not base units, and
+the multiplier varies wildly per symbol (Gate `PEPE_USDT` is 10,000,000 PEPE per
+contract; OKX `BTC-USDT-SWAP` is 0.01 BTC). Universe discovery reads each
+venue's multiplier and `common::run_ws_exchange` converts every book to base
+units centrally, so connector `parse` implementations emit the venue's native
+units untouched. An unknown or unparseable multiplier defaults to `1` — never
+scale by a guess.
+
+| Exchange | Book units | Source field | Endpoint |
+|---|---|---|---|
+| Bybit   | base coin | — | — |
+| OKX     | contracts | `ctVal` × `ctMult` | `/api/v5/public/instruments?instType=SWAP` |
+| MEXC    | contracts | `contractSize` | `/api/v1/contract/detail` |
+| Bitget  | base coin | — | — |
+| Gate    | contracts | `quanto_multiplier` | `/api/v4/futures/usdt/contracts` |
+| CoinEx  | base coin | — | — |
+| KuCoin  | lots | `multiplier` | `/api/v1/contracts/active` |
+| Phemex  | base coin (`PerpetualV2`) | — | — |
+
 ### Known imprecisions
 
-- **Gate** uses `book_ticker` (best bid/ask only); sizes are in *contracts*, so
-  executable notional is approximate. For real depth switch to
-  `futures.order_book`/`futures.order_book_update` (snapshot+delta) and apply the
-  contract multiplier.
+- **Gate** uses `book_ticker` (best bid/ask only), so executable notional past
+  the top level is unknown. For real depth switch to
+  `futures.order_book`/`futures.order_book_update` (snapshot+delta).
 - **Phemex** USDT (`*_p`) channels use real numbers; legacy inverse contracts use
-  scaled integers — verify the scale for your symbols.
+  scaled integers — those products are not screened.
+- Contract sizes are snapshotted at startup. A symbol relisted with a different
+  multiplier mid-session keeps the old one until restart.
 - **Funding** interval is hard-coded to 8h for annualization; some symbols use
   4h/1h. Read the per-symbol interval from the ticker where available.
 

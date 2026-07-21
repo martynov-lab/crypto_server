@@ -19,9 +19,9 @@ pub struct DiscoveryConfig {
 pub async fn refresh_once(client: &Client, store: &UniverseStore, exchanges: &[ExchangeId]) {
     for &exchange in exchanges {
         match fetch(client, exchange).await {
-            Ok(bases) => {
-                let n = bases.len();
-                store.set_exchange(exchange, &bases);
+            Ok(listings) => {
+                let n = listings.len();
+                store.set_exchange(exchange, &listings);
                 info!(exchange = %exchange, listed = n, "universe refreshed");
             }
             Err(e) => warn!(exchange = %exchange, error = %e, "universe fetch failed"),

@@ -5,6 +5,11 @@ Server is Rust/axum; transport is WebSocket for the signal stream plus a few RES
 endpoints. Everything here is derived from the running server
 (`crates/api/src/session.rs`, `crates/screener/src/config.rs`).
 
+> **Already integrated against an older server?** Read
+> [§7 Migration](#7-migration--screener-economics-update) first: the signal
+> payload gained the field that actually represents profit, and several existing
+> values changed magnitude.
+
 ## 0. Wire-format rules (read first)
 
 - **All monetary/ratio numbers are JSON strings, not numbers.** Decimals
@@ -87,6 +92,11 @@ non-duplicate signal appears for a screened instrument:
     "vwap_sell": "1.2712",
     "gross_pct": "0.0301",
     "net_pct": "0.0289",
+    "out_pct": "-0.0014",
+    "round_trip_pct": "0.0246",
+    "funding_cost_pct": "0.0000",
+    "expected_profit_quote": "49.20",
+    "leg_skew_ms": 120,
     "executable_notional": "2000",
     "capped_by_depth": false
   },
@@ -97,10 +107,12 @@ non-duplicate signal appears for a screened instrument:
   },
   "dynamics": {
     "baseline_pct": "0.0031",
+    "mad_pct": "0.0012",
     "stddev_pct": "0.0090",
     "current_pct": "0.0289",
     "z_score": "3.41",
     "sample_count": 120,
+    "baseline_samples": 98,
     "episode_ms": 1400
   },
   "quality_score": "66.2",
@@ -110,19 +122,46 @@ non-duplicate signal appears for a screened instrument:
 
 `funding`, `dynamics`, and `quality_score` are **omitted** when unavailable.
 `buy_exchange` is where you buy (lowest ask); `sell_exchange` is where you sell
-(highest bid). `net_pct` is already net of taker fees on both legs.
+(highest bid).
+
+**Which number is the profit.** A cross-exchange futures arb is two round trips
+of taker orders — open both legs, then close both legs — so the entry spread
+alone overstates the edge:
+
+- `net_pct` — the **entry** spread, net of the two *entry* taker fees. Good for
+  display and comparison with older clients; it is not the trade's profit.
+- `out_pct` — what unwinding right now at the current books would cost, net of
+  the exit fees. Normally negative: the entry edge has to cover it.
+- `round_trip_pct` — **the number to trade on.** Entry spread minus the expected
+  unwind level (the coin's rolling baseline), minus the other two taker fees,
+  minus the funding carry. Signals are gated on this via `min_round_trip_pct`.
+- `funding_cost_pct` — funding paid (positive) or earned (negative) over the
+  assumed hold, already included in `round_trip_pct`.
+- `expected_profit_quote` — `round_trip_pct × executable_notional`, i.e. the edge
+  in USDT. Pairs are ranked by this, because a 5% edge on $50 of depth is worth
+  less than a 2% edge on $2000.
+- `leg_skew_ms` — how far apart in time the two legs' books were observed. Large
+  values mean the two sides never coexisted; the server rejects those.
 
 **Spread dynamics** describe the coin's behavior (shared, computed with default
 fees), and are the key "real vs mirage" signal:
 
-- `baseline_pct` — median spread over the rolling window. A *tight* baseline
-  (near 0–1%) with a large `current_pct` is the healthy, capturable pattern.
-- `z_score` — how many stddevs the current spread is above its own mean; a high
-  z is a genuine spike, not "it's always wide".
+- `baseline_pct` — **median** spread over the *quiet* part of the window. A tight
+  baseline (near 0–1%) with a large `current_pct` is the healthy, capturable
+  pattern. This is also the level `round_trip_pct` assumes the position unwinds
+  at.
+- `baseline_samples` — how many samples fed the baseline. Samples recorded since
+  the current episode opened are excluded, so a spike cannot inflate the
+  baseline it is measured against.
+- `mad_pct` — median absolute deviation (scaled to a stddev equivalent). Robust
+  dispersion; `stddev_pct` is kept alongside it for display.
+- `z_score` — how many robust deviations the current spread sits above the quiet
+  baseline; a high z is a genuine spike, not "it's always wide".
 - `episode_ms` — how long the spread has stayed above the reference threshold. A
   large value means it's *not* reverting — likely a structural trap.
-- `quality_score` (0–100) — combines tight baseline + strong spike + short
-  episode + broad venue coverage. Sort/alert by this to surface the best coins.
+- `quality_score` (0–100) — weighted mostly by what decides profitability: the
+  round-trip edge and the depth behind it, then spike strength, baseline
+  tightness, leg freshness, and venue coverage. Sort/alert by this.
 
 ### 2.3 Keepalive
 
@@ -265,13 +304,17 @@ should render the newest event per instrument and not assume every tick arrives.
 | `target_notional_q` | decimal-str | `"2000"` | USDT size the VWAP spread is measured at |
 | `min_executable_notional` | decimal-str | `"500"` | Required real depth on both legs |
 | `depth_levels_n` | int | `20` | Book levels walked for VWAP |
+| `min_round_trip_pct` | decimal-str | `"0.001"` | **Profitability gate**: floor on `round_trip_pct` (entry minus unwind level, four taker fees, funding carry) |
 | `taker_fee` | map<exch,decimal-str> | per-venue | Taker fee fractions |
 | `include_funding_diff` | bool | `true` | Emit funding differential |
 | `min_funding_diff_apr` | decimal-str | `"0.15"` | Min annualized funding diff |
-| `funding_hold_hours` | decimal-str | `"8"` | Assumed hold for funding calc |
+| `funding_hold_hours` | decimal-str | `"8"` | Assumed hold, for both the funding signal and the carry charged to `round_trip_pct` |
+| `include_funding_cost` | bool | `true` | Subtract the pair's funding carry from `round_trip_pct` |
 | `require_transferable` | bool | `false` | Settlement asset transferable both legs |
 | `require_common_network` | bool | `false` | Shared enabled chain both legs |
 | `max_book_age_ms` | int | `3000` | Staleness cutoff |
+| `max_leg_skew_ms` | int | `750` | Max age gap between the two legs' books; `0` = off |
+| `max_price_deviation_pct` | decimal-str? | `"0.10"` | Drop a venue whose mid is this far from the cross-venue median (needs ≥3 venues); `null` = off |
 | `enable_dynamics` | bool | `true` | Master switch for the spread-dynamics filters |
 | `max_baseline_spread_pct` | decimal-str | `"0.01"` | Reject persistently-wide coins (baseline above this) |
 | `min_spike_z` | decimal-str | `"3"` | Require current spread ≥ this many stddevs above its mean |
@@ -279,6 +322,7 @@ should render the newest event per instrument and not assume every tick arrives.
 | `min_dynamics_samples` | int | `20` | Warmup before dynamics filters apply |
 | `max_chart_spread_pct` | decimal-str | `"0.50"` | Chart anomaly cutoff: watch backfill/ticks whose abs(net_pct) exceeds this are dropped for this client (wrong-token / stale-quote data errors) |
 | `hysteresis_step_pct` | decimal-str | `"0.005"` | Re-alert only if spread widens this much |
+| `episode_close_ticks` | int | `3` | Consecutive rejects before an episode closes and hysteresis re-arms |
 | `min_signal_lifetime_ms` | int | `1500` | Suppress until opportunity persists this long |
 | `cooldown_ms` | int | `2000` | Min gap between emits per instrument |
 | `max_signals_per_min` | int? | `120` | Global per-session rate cap |
@@ -341,3 +385,113 @@ the rows with its local config (e.g. its own `deny_symbols`).
   transfer data is partial). Leave them off unless the operator has populated the
   transfer store for the relevant venues.
 - Only `perp` markets exist in Phase 1. `kind` is always `"perp"`.
+
+## 7. Migration — screener economics update
+
+For clients already integrated against an earlier server build. **The wire schema
+only gained fields — nothing was removed or renamed**, so a tolerant parser keeps
+working untouched. But several existing values changed meaning or magnitude, and
+one of the new fields is the one that actually represents profit.
+
+### 7.1 Required: tolerate the new fields
+
+The only way this update breaks an existing client is a strict/exhaustive JSON
+parser rejecting unknown keys. Check for:
+
+- Dart / `json_serializable` — `disallowUnrecognizedKeys` must not be `true`.
+- Kotlin / `kotlinx.serialization` — `Json { ignoreUnknownKeys = true }`.
+- TypeScript / zod — `.passthrough()`, not `.strict()`.
+- Swift / `Codable` — tolerant by default, nothing to do.
+
+Nothing else is required. Everything below is a behavior change to account for.
+
+### 7.2 New fields in `event.spread`
+
+Remember [§0](#0-wire-format-rules-read-first): decimals arrive as **strings**;
+`leg_skew_ms` is a plain **number**.
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `round_trip_pct` | string | **The profit of the trade.** Entry spread minus the expected unwind level, four taker fees, and the funding carry |
+| `out_pct` | string | Cost of unwinding right now at the current books (normally negative) |
+| `funding_cost_pct` | string | Funding over the assumed hold; already inside `round_trip_pct` |
+| `expected_profit_quote` | string | `round_trip_pct × executable_notional`, in USDT |
+| `leg_skew_ms` | number | Age gap between the two legs' books |
+
+**The UI change that matters:** `net_pct` is the *entry* spread only — opening is
+half the operation, and a cross-exchange futures arb pays taker fees four times,
+not twice. A client that presents `net_pct` as the opportunity's profit overstates
+it by roughly 0.1–0.2% and will show trades that lose money.
+
+Make `round_trip_pct` the headline number on the signal card and demote `net_pct`
+to a secondary line labelled "entry". `expected_profit_quote` reads well next to
+it ("~12.3 USDT on 2000").
+
+### 7.3 New fields in `event.dynamics`
+
+`mad_pct` (string) — robust dispersion; `baseline_samples` (number) — how many
+samples fed the baseline.
+
+`z_score` is now measured against the **median of the quiet window** using MAD,
+rather than the mean and stddev of the whole window (a spike used to inflate the
+dispersion it was being judged against, masking itself). Absolute z values have
+therefore shifted — **recalibrate any client-side z thresholds**.
+
+### 7.4 `quality_score` is now always present
+
+It used to be **omitted** until enough history existed. It is now sent on every
+event, with the baseline/spike terms held neutral during warmup. Any logic of the
+form *"score missing ⇒ still warming up"* no longer works — use
+`dynamics.baseline_samples` for that instead.
+
+The scale was also reweighted: it is now dominated by the round-trip edge and the
+depth behind it, then spike strength, baseline tightness, leg freshness, and venue
+coverage. **Old cutoffs (e.g. "alert above 70") are not comparable** and need to be
+re-picked.
+
+### 7.5 Behavior changes with no client code involved
+
+Worth telling users about in advance, or the update reads as a regression:
+
+- **Noticeably fewer signals.** The round-trip filter removes opportunities that
+  cleared the entry band but lost money after closing. On a live run that was 451
+  rejections in 2.5 minutes.
+- **`executable_notional` and `capped_by_depth` shift by orders of magnitude** on
+  OKX, Gate, KuCoin, and MEXC. Those venues quote book sizes in *contracts*, which
+  were previously read as base units — one Gate `PEPE_USDT` contract is 10,000,000
+  PEPE, one OKX `BTC-USDT-SWAP` contract is 0.01 BTC. The old numbers were wrong in
+  both directions; the new ones are correct. Re-check any hardcoded depth
+  thresholds on the client.
+- **`dynamics.baseline_pct`** is now the median of the quiet window, so it no
+  longer drifts upward during a spike.
+
+### 7.6 Not exposed to the client
+
+The screener gained rejection reasons (`leg_skew`, `negative_round_trip`,
+`price_outlier`). These are **server-side only** — surfaced through the
+`screener_rejections_total{reason=...}` Prometheus counter on `/metrics`, never in
+the WS payload. There is nothing to handle on the client.
+
+### 7.7 New `subscribe` settings (all optional)
+
+Omit them to inherit the server defaults shown here; see
+[§3](#3-clientconfig-reference-all-fields-optional-on-subscribe) for details.
+
+```json
+{
+  "min_round_trip_pct": "0.001",
+  "include_funding_cost": true,
+  "max_leg_skew_ms": 750,
+  "max_price_deviation_pct": "0.10",
+  "episode_close_ticks": 3
+}
+```
+
+If the app has a filter-settings screen, `min_round_trip_pct` is the one to add
+first — it is the real profitability control, more important than
+`min_net_spread_pct`.
+
+### 7.8 Unchanged
+
+The chart (`watch`, `/spread/history`) and `/summary` are untouched in both shape
+and meaning.

@@ -123,6 +123,74 @@ pub fn executable_spread(
     })
 }
 
+/// Full economics of a fixed long/short venue pair, including the unwind.
+///
+/// A cross-exchange futures arb is **two** round trips of taker orders: you
+/// open (buy the cheap venue's ask, sell the rich venue's bid) and later close
+/// (sell the cheap venue's bid, buy back the rich venue's ask). Judging the
+/// trade on the entry spread alone understates the cost by two taker fees and
+/// ignores the funding carried while the position is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairEconomics {
+    /// Entry leg: VWAPs, gross/net entry spread, executable size.
+    pub entry: ExecSpread,
+    /// Cost of unwinding immediately at the current books, net of exit fees.
+    /// Normally negative; the entry edge has to cover it.
+    pub out_pct: Decimal,
+    /// Expected profit of the whole trade, net of four taker fees and funding.
+    pub round_trip_pct: Decimal,
+    /// Funding paid (positive) / earned (negative) over the assumed hold.
+    pub funding_cost_pct: Decimal,
+    /// `round_trip_pct * executable_notional` — edge in quote currency.
+    pub expected_profit_quote: Decimal,
+}
+
+/// Compute [`PairEconomics`] for going long on the `buy_*` venue and short on
+/// the `sell_*` venue.
+///
+/// `convergence_pct` is the **net-entry-space** spread level the position is
+/// expected to unwind at — the instrument's rolling baseline. Passing zero
+/// assumes full convergence, which is the optimistic bound.
+#[allow(clippy::too_many_arguments)]
+pub fn pair_economics(
+    buy_asks: &[BookLevel],
+    buy_bids: &[BookLevel],
+    sell_bids: &[BookLevel],
+    sell_asks: &[BookLevel],
+    target_q: Decimal,
+    fee_buy: Decimal,
+    fee_sell: Decimal,
+    convergence_pct: Decimal,
+    funding_cost_pct: Decimal,
+) -> Option<PairEconomics> {
+    let entry = executable_spread(buy_asks, sell_bids, target_q, fee_buy, fee_sell)?;
+    let fees_one_way = fee_buy + fee_sell;
+
+    // Unwind at the current books, sized to the entry's executable notional so
+    // both directions describe the same position.
+    let q = entry.executable_notional;
+    let out_pct = match (vwap_sell(buy_bids, q), vwap_buy(sell_asks, q)) {
+        (Some(long_exit), Some(short_exit)) if short_exit.vwap > Decimal::ZERO => {
+            (long_exit.vwap - short_exit.vwap) / short_exit.vwap - fees_one_way
+        }
+        // Unwind side unknown (one-sided book): fall back to the symmetric
+        // assumption that closing costs the same fees as opening.
+        _ => -entry.gross_pct - fees_one_way,
+    };
+
+    // Entry net already carries one round of fees; the unwind costs another,
+    // and the position only realizes what it gains above the convergence level.
+    let round_trip_pct = entry.net_pct - convergence_pct - fees_one_way - funding_cost_pct;
+
+    Some(PairEconomics {
+        expected_profit_quote: round_trip_pct * entry.executable_notional,
+        entry,
+        out_pct,
+        round_trip_pct,
+        funding_cost_pct,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +251,72 @@ mod tests {
         assert!(s.capped_by_depth);
         assert!(s.executable_notional <= dec!(550));
         assert_eq!(s.gross_pct, dec!(0.10));
+    }
+
+    #[test]
+    fn round_trip_charges_four_fees() {
+        // Long venue: bid 99.9 / ask 100. Short venue: bid 106 / ask 106.1.
+        // Entry gross 6%, fees 0.06% x2 per side.
+        let e = pair_economics(
+            &[lvl(dec!(100), dec!(100))],   // long venue asks
+            &[lvl(dec!(99.9), dec!(100))],  // long venue bids
+            &[lvl(dec!(106), dec!(100))],   // short venue bids
+            &[lvl(dec!(106.1), dec!(100))], // short venue asks
+            dec!(1000),
+            dec!(0.0006),
+            dec!(0.0006),
+            dec!(0), // assume full convergence
+            dec!(0),
+        )
+        .unwrap();
+        assert_eq!(e.entry.gross_pct, dec!(0.06));
+        assert_eq!(e.entry.net_pct, dec!(0.06) - dec!(0.0012));
+        // Round trip pays 0.0012 twice.
+        assert_eq!(e.round_trip_pct, dec!(0.06) - dec!(0.0024));
+        assert!(e.out_pct < dec!(0), "unwinding now must cost money");
+        assert_eq!(e.expected_profit_quote, e.round_trip_pct * dec!(1000));
+    }
+
+    #[test]
+    fn round_trip_turns_negative_on_a_thin_edge() {
+        // 0.15% gross edge cannot cover 4 x 0.06% fees.
+        let e = pair_economics(
+            &[lvl(dec!(100), dec!(100))],
+            &[lvl(dec!(99.99), dec!(100))],
+            &[lvl(dec!(100.15), dec!(100))],
+            &[lvl(dec!(100.16), dec!(100))],
+            dec!(1000),
+            dec!(0.0006),
+            dec!(0.0006),
+            dec!(0),
+            dec!(0),
+        )
+        .unwrap();
+        assert!(e.entry.net_pct > dec!(0), "entry alone looks profitable");
+        assert!(e.round_trip_pct < dec!(0), "round trip is not");
+    }
+
+    #[test]
+    fn convergence_and_funding_reduce_the_edge() {
+        let base = |conv, funding| {
+            pair_economics(
+                &[lvl(dec!(100), dec!(100))],
+                &[lvl(dec!(99.9), dec!(100))],
+                &[lvl(dec!(106), dec!(100))],
+                &[lvl(dec!(106.1), dec!(100))],
+                dec!(1000),
+                dec!(0),
+                dec!(0),
+                conv,
+                funding,
+            )
+            .unwrap()
+            .round_trip_pct
+        };
+        // Exiting at a 1% baseline instead of 0 costs exactly that 1%.
+        assert_eq!(base(dec!(0.01), dec!(0)), base(dec!(0), dec!(0)) - dec!(0.01));
+        // Funding carry is subtracted too.
+        assert_eq!(base(dec!(0), dec!(0.002)), base(dec!(0), dec!(0)) - dec!(0.002));
     }
 
     #[test]

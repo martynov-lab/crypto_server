@@ -19,8 +19,27 @@ pub struct Spread {
     pub vwap_sell: Decimal,
     /// (vwap_sell - vwap_buy) / vwap_buy, before fees.
     pub gross_pct: Decimal,
-    /// gross - taker_fee_buy - taker_fee_sell.
+    /// Entry spread only: gross - taker_fee_buy - taker_fee_sell. Kept for
+    /// backward compatibility — **not** the profit of the trade, see
+    /// `round_trip_pct`.
     pub net_pct: Decimal,
+    /// Cost of unwinding *right now* at the current books, net of the exit
+    /// taker fees (sell the long leg's bid, buy back the short leg's ask).
+    /// Normally negative — the entry edge is what has to cover it.
+    pub out_pct: Decimal,
+    /// Expected profit of the full round trip: enter now, unwind when the
+    /// spread converges to its rolling baseline. Nets **four** taker fees and
+    /// the expected funding carry. This is the number worth trading on.
+    pub round_trip_pct: Decimal,
+    /// Expected funding paid (positive) or earned (negative) over the assumed
+    /// hold, already included in `round_trip_pct`.
+    pub funding_cost_pct: Decimal,
+    /// `round_trip_pct * executable_notional` — the edge in quote currency,
+    /// which is what pairs are actually ranked by.
+    pub expected_profit_quote: Decimal,
+    /// Age difference between the two legs' books (ms). A large skew means the
+    /// two sides were observed at different times and the spread is an artifact.
+    pub leg_skew_ms: u64,
     /// Quote notional (USDT) the spread was actually computed over. May be less
     /// than the requested target size when the book is thin.
     pub executable_notional: Decimal,
@@ -134,6 +153,15 @@ pub enum SpreadReason {
     NotASpike,
     /// Spread has stayed wide too long — likely a trap that never converges.
     TooPersistent,
+    /// The two legs' books were observed too far apart in time — the spread is
+    /// a timing artifact, not a simultaneous quote.
+    LegSkew,
+    /// Entry edge does not cover the round trip (four taker fees + funding
+    /// carry + expected convergence level).
+    NegativeRoundTrip,
+    /// One leg's mid price is far from the cross-venue median — wrong token,
+    /// stale quote, or a redenomination, not an arb.
+    PriceOutlier,
 }
 
 #[cfg(test)]

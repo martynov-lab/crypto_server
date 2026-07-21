@@ -76,18 +76,26 @@ min_24h_quote_volume = "100000"
 max_24h_quote_volume = "200000"
 min_open_interest = "0"      # base units; 0 => disabled
 
-# Spread band — the 0.6%..25% control. Spreads outside the band are not sent
-# to the client (below = not worth the fees, above = ghost/delisted market).
+# Entry-spread band — the 0.6%..25% control. Spreads outside the band are not
+# sent to the client (below = not worth the fees, above = ghost/delisted market).
+# NOTE: this bounds the *entry* only. Profitability is gated by
+# min_round_trip_pct below, which also charges the unwind and the funding carry.
 min_net_spread_pct = "0.006"
 max_net_spread_pct = "0.25"
 target_notional_q = "2000"   # USDT size the executable VWAP spread is measured against
 min_executable_notional = "500"
 depth_levels_n = 20
+# Floor on the round-trip edge: entry spread minus the expected unwind level,
+# minus FOUR taker fees (open + close on both legs), minus funding carry.
+# A cross-exchange futures arb is two round trips of taker orders, so judging it
+# on the entry spread alone overstates the edge by roughly 0.1–0.2%.
+min_round_trip_pct = "0.001"
 
 # Funding differential (perp, latency-tolerant signal).
 include_funding_diff = true
 min_funding_diff_apr = "0.15"   # 15% annualized
-funding_hold_hours = "8"
+funding_hold_hours = "8"        # assumed hold; also sizes the funding carry below
+include_funding_cost = true     # charge the pair's funding carry against the edge
 
 # Reality filters (mirage killers).
 # NOTE: In Phase 1 (no exchange keys) transfer status comes only from PUBLIC
@@ -98,6 +106,13 @@ funding_hold_hours = "8"
 require_transferable = false      # settlement asset deposit+withdraw enabled on both legs
 require_common_network = false    # both legs share >=1 enabled chain for settlement asset
 max_book_age_ms = 3000
+# Both legs can be individually "fresh" and still describe moments far enough
+# apart that the spread between them never actually existed.
+max_leg_skew_ms = 750
+# Drop a venue whose mid price is this far from the cross-venue median — wrong
+# token, frozen market, or a redenomination. Needs >=3 venues to have a median;
+# two-venue pairs are left to max_net_spread_pct. Empty string disables it.
+max_price_deviation_pct = "0.10"
 
 # Spread dynamics — the "tight baseline, brief spike" signature of a good arb coin.
 enable_dynamics = true
@@ -109,6 +124,7 @@ max_chart_spread_pct = "0.50"     # client-side chart anomaly cutoff (drops |net
 
 # Noise control.
 hysteresis_step_pct = "0.005"     # re-alert only when spread widens 0.5% past prior peak
+episode_close_ticks = 3           # consecutive rejects before an episode is considered over
 min_signal_lifetime_ms = 1500
 cooldown_ms = 2000
 max_signals_per_min = 120

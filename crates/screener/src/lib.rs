@@ -42,6 +42,29 @@ pub struct ScreenerEvent {
     pub ts_ms: i64,
 }
 
+/// Static label for a rejection reason, for use as a metric dimension.
+fn reason_label(reason: &SpreadReason) -> &'static str {
+    match reason {
+        SpreadReason::Signal => "signal",
+        SpreadReason::BboOnly => "bbo_only",
+        SpreadReason::BelowMinSpread => "below_min_spread",
+        SpreadReason::AboveMaxSpread => "above_max_spread",
+        SpreadReason::InsufficientDepth => "insufficient_depth",
+        SpreadReason::NotTransferable => "not_transferable",
+        SpreadReason::NoCommonNetwork => "no_common_network",
+        SpreadReason::StaleBook => "stale_book",
+        SpreadReason::BelowMinVolume => "below_min_volume",
+        SpreadReason::AboveMaxVolume => "above_max_volume",
+        SpreadReason::BelowMinOpenInterest => "below_min_open_interest",
+        SpreadReason::PersistentWide => "persistent_wide",
+        SpreadReason::NotASpike => "not_a_spike",
+        SpreadReason::TooPersistent => "too_persistent",
+        SpreadReason::LegSkew => "leg_skew",
+        SpreadReason::NegativeRoundTrip => "negative_round_trip",
+        SpreadReason::PriceOutlier => "price_outlier",
+    }
+}
+
 /// Per-instrument screening state for one client.
 #[derive(Debug, Default)]
 struct InstrState {
@@ -49,6 +72,8 @@ struct InstrState {
     /// When the current above-threshold episode began (for lifetime + persistence).
     opened_at: Option<Instant>,
     last_emit: Option<Instant>,
+    /// Consecutive non-signal evaluations, for debounced episode close.
+    reject_streak: u32,
 }
 
 /// Simple rolling per-minute emit counter for the whole engine (per client).
@@ -95,20 +120,33 @@ impl ScreenerEngine {
         let mut st = self.state.entry(snapshot.instrument.clone()).or_default();
 
         if eval.reason != SpreadReason::Signal {
-            // Opportunity gone or rejected — close the episode, measure lifetime,
-            // and reset hysteresis so the next crossing can fire again.
-            if let Some(opened) = st.opened_at.take() {
-                let lifetime = now.saturating_duration_since(opened);
-                debug!(
-                    instrument = %snapshot.instrument,
-                    reason = ?eval.reason,
-                    lifetime_ms = lifetime.as_millis() as u64,
-                    "spread episode closed"
-                );
+            // Which filter is doing the rejecting is the first thing you need
+            // when the screener goes quiet, so it is a labelled counter rather
+            // than a log line lost in the per-tick volume.
+            metrics::counter!(
+                "screener_rejections_total",
+                "reason" => reason_label(&eval.reason),
+            )
+            .increment(1);
+            // Debounced episode close: one tick grazing a filter boundary is
+            // noise, not the end of the opportunity. Only a sustained run of
+            // rejections closes the episode and re-arms hysteresis.
+            st.reject_streak += 1;
+            if st.reject_streak >= self.cfg.episode_close_ticks.max(1) {
+                if let Some(opened) = st.opened_at.take() {
+                    let lifetime = now.saturating_duration_since(opened);
+                    debug!(
+                        instrument = %snapshot.instrument,
+                        reason = ?eval.reason,
+                        lifetime_ms = lifetime.as_millis() as u64,
+                        "spread episode closed"
+                    );
+                }
+                st.peak = PeakState::default();
             }
-            st.peak = PeakState::default();
             return None;
         }
+        st.reject_streak = 0;
 
         // --- Signal path ---
         if st.opened_at.is_none() {
@@ -116,6 +154,24 @@ impl ScreenerEngine {
         }
         let opened = st.opened_at.unwrap_or(now);
 
+        // Every non-mutating gate runs *before* hysteresis. `PeakState::decide`
+        // raises the peak as a side effect, so calling it first would let a
+        // suppressed tick consume the crossing: the peak moves up, the emit is
+        // then dropped by lifetime/cooldown/rate, and the opportunity can never
+        // fire again until it widens by another hysteresis step. A steady
+        // in-band spread produced no alert at all because of this.
+        if now.saturating_duration_since(opened)
+            < Duration::from_millis(self.cfg.min_signal_lifetime_ms)
+        {
+            return None;
+        }
+        if let Some(last) = st.last_emit {
+            if now.saturating_duration_since(last) < Duration::from_millis(self.cfg.cooldown_ms) {
+                return None;
+            }
+        }
+
+        let previous_peak = st.peak.clone();
         let decision = st.peak.decide(
             eval.spread.net_pct,
             self.cfg.min_net_spread_pct,
@@ -125,22 +181,10 @@ impl ScreenerEngine {
             return None;
         }
 
-        // Persistence filter: require the episode to have lasted long enough.
-        let persisted = now.saturating_duration_since(opened)
-            >= Duration::from_millis(self.cfg.min_signal_lifetime_ms);
-        if !persisted {
-            return None;
-        }
-
-        // Cooldown between emissions for the same instrument.
-        if let Some(last) = st.last_emit {
-            if now.saturating_duration_since(last) < Duration::from_millis(self.cfg.cooldown_ms) {
-                return None;
-            }
-        }
-
-        // Global per-minute rate cap.
+        // Global per-minute rate cap. Restore the peak when it denies the emit,
+        // so a rate-limited tick doesn't silently consume the crossing either.
         if !self.allow_emit(now) {
+            st.peak = previous_peak;
             return None;
         }
 
@@ -247,6 +291,82 @@ mod tests {
         let snap = snapshot(dec!(100), dec!(150));
         let e = engine.on_instrument(&snap, &NoTransferInfo, Instant::now(), 1);
         assert!(e.is_none());
+    }
+
+    /// Regression: hysteresis used to run before the lifetime gate, so the very
+    /// first tick raised the peak while its emit was discarded for being too
+    /// young — and every later tick at the same spread was then "not a new
+    /// peak". A steady, perfectly tradable spread produced zero alerts.
+    #[test]
+    fn steady_spread_emits_once_it_has_persisted() {
+        let mut c = cfg_no_transfer();
+        c.min_signal_lifetime_ms = 1500;
+        let engine = ScreenerEngine::new(c);
+        let snap = snapshot(dec!(100), dec!(106));
+        let t0 = Instant::now();
+
+        assert!(
+            engine.on_instrument(&snap, &NoTransferInfo, t0, 1).is_none(),
+            "episode is younger than min_signal_lifetime_ms"
+        );
+        let t1 = t0 + Duration::from_millis(2000);
+        assert!(
+            engine.on_instrument(&snap, &NoTransferInfo, t1, 2).is_some(),
+            "same spread must alert once it has persisted"
+        );
+    }
+
+    /// A tick denied by the global rate cap must not consume the crossing
+    /// either — the peak is restored so the next allowed tick can still fire.
+    #[test]
+    fn rate_limited_tick_does_not_consume_the_crossing() {
+        let mut c = cfg_no_transfer();
+        c.max_signals_per_min = Some(1);
+        let engine = ScreenerEngine::new(c);
+        let snap_a = snapshot(dec!(100), dec!(106));
+        let mut snap_b = snapshot(dec!(100), dec!(106));
+        snap_b.instrument = Instrument::perp("ABC", "USDT");
+        let t0 = Instant::now();
+
+        assert!(engine.on_instrument(&snap_a, &NoTransferInfo, t0, 1).is_some());
+        assert!(
+            engine.on_instrument(&snap_b, &NoTransferInfo, t0, 2).is_none(),
+            "second instrument is over the per-minute cap"
+        );
+        // New rate window: the deferred opportunity is still alertable.
+        let t1 = t0 + Duration::from_secs(61);
+        assert!(
+            engine.on_instrument(&snap_b, &NoTransferInfo, t1, 3).is_some(),
+            "rate cap must defer the signal, not destroy it"
+        );
+    }
+
+    /// One rejected tick is noise; only a sustained run of them closes the
+    /// episode and re-arms hysteresis.
+    #[test]
+    fn episode_close_is_debounced() {
+        let mut c = cfg_no_transfer();
+        c.episode_close_ticks = 3;
+        let engine = ScreenerEngine::new(c);
+        let good = snapshot(dec!(100), dec!(106));
+        let flat = snapshot(dec!(100), dec!(100.05)); // below the spread floor
+        let t = Instant::now();
+
+        assert!(engine.on_instrument(&good, &NoTransferInfo, t, 1).is_some());
+        // A single boundary-grazing tick must not re-arm the engine.
+        assert!(engine.on_instrument(&flat, &NoTransferInfo, t, 2).is_none());
+        assert!(
+            engine.on_instrument(&good, &NoTransferInfo, t, 3).is_none(),
+            "episode is still open; this is the same opportunity"
+        );
+        // Three in a row does close it.
+        for i in 0..3 {
+            assert!(engine.on_instrument(&flat, &NoTransferInfo, t, 10 + i).is_none());
+        }
+        assert!(
+            engine.on_instrument(&good, &NoTransferInfo, t, 20).is_some(),
+            "a genuinely new episode alerts again"
+        );
     }
 
     #[test]

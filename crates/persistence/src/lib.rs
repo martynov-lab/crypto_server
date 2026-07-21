@@ -23,7 +23,7 @@ impl CsvSink {
         if is_new {
             writeln!(
                 w,
-                "ts_ms,instrument,buy_exchange,sell_exchange,gross_pct,net_pct,executable_notional,capped_by_depth,funding_diff_apr"
+                "ts_ms,instrument,buy_exchange,sell_exchange,gross_pct,net_pct,out_pct,round_trip_pct,funding_cost_pct,expected_profit_quote,leg_skew_ms,executable_notional,capped_by_depth,funding_diff_apr"
             )?;
             w.flush()?;
         }
@@ -41,7 +41,7 @@ impl CsvSink {
             .unwrap_or_default();
         let s = &ev.spread;
         let line = format!(
-            "{},{}/{},{},{},{},{},{},{},{}",
+            "{},{}/{},{},{},{},{},{},{},{},{},{},{},{},{}",
             ev.ts_ms,
             s.instrument.base,
             s.instrument.quote,
@@ -49,6 +49,11 @@ impl CsvSink {
             s.sell_exchange,
             s.gross_pct,
             s.net_pct,
+            s.out_pct,
+            s.round_trip_pct,
+            s.funding_cost_pct,
+            s.expected_profit_quote,
+            s.leg_skew_ms,
             s.executable_notional,
             s.capped_by_depth,
             funding,

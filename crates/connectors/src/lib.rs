@@ -20,20 +20,38 @@ pub mod mock;
 
 use async_trait::async_trait;
 use common::{run_ws_exchange, Backoff, WsExchange};
-use domain::{ExchangeConnector, ExchangeId, Instrument, MarketUpdate};
+use domain::{Decimal, ExchangeConnector, ExchangeId, Instrument, MarketUpdate};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// Base units per contract, keyed by canonical base asset, for one venue.
+/// Sourced from universe discovery; empty means "this venue quotes base units".
+pub type ContractSizes = HashMap<String, Decimal>;
 
 /// Adapts a [`WsExchange`] into an [`ExchangeConnector`] by running it through
 /// the shared reconnecting WS driver.
 pub struct WsConnector<E: WsExchange> {
     inner: E,
     backoff: Backoff,
+    contract_sizes: ContractSizes,
 }
 
 impl<E: WsExchange> WsConnector<E> {
     pub fn new(inner: E, backoff: Backoff) -> Self {
-        WsConnector { inner, backoff }
+        WsConnector::with_contract_sizes(inner, backoff, ContractSizes::new())
+    }
+
+    pub fn with_contract_sizes(
+        inner: E,
+        backoff: Backoff,
+        contract_sizes: ContractSizes,
+    ) -> Self {
+        WsConnector {
+            inner,
+            backoff,
+            contract_sizes,
+        }
     }
 }
 
@@ -48,25 +66,39 @@ impl<E: WsExchange> ExchangeConnector for WsConnector<E> {
         symbols: Vec<Instrument>,
         tx: mpsc::Sender<MarketUpdate>,
     ) -> anyhow::Result<()> {
-        run_ws_exchange(&self.inner, symbols, tx, self.backoff.clone()).await
+        run_ws_exchange(
+            &self.inner,
+            symbols,
+            tx,
+            self.backoff.clone(),
+            self.contract_sizes.clone(),
+        )
+        .await
     }
 }
 
 /// Build a live connector for the given exchange. `depth` is the desired book
 /// depth; each connector snaps it to a channel the venue actually supports.
+/// `sizes` converts venues that quote books in contracts into base units.
 pub fn build_connector(
     id: ExchangeId,
     depth: usize,
     backoff: Backoff,
+    sizes: ContractSizes,
 ) -> Arc<dyn ExchangeConnector> {
+    macro_rules! wire {
+        ($venue:expr) => {
+            Arc::new(WsConnector::with_contract_sizes($venue, backoff, sizes))
+        };
+    }
     match id {
-        ExchangeId::Bybit => Arc::new(WsConnector::new(bybit::Bybit::new(depth), backoff)),
-        ExchangeId::Okx => Arc::new(WsConnector::new(okx::Okx::new(depth), backoff)),
-        ExchangeId::Mexc => Arc::new(WsConnector::new(mexc::Mexc::new(depth), backoff)),
-        ExchangeId::Bitget => Arc::new(WsConnector::new(bitget::Bitget::new(depth), backoff)),
-        ExchangeId::Gate => Arc::new(WsConnector::new(gate::Gate::new(depth), backoff)),
-        ExchangeId::Coinex => Arc::new(WsConnector::new(coinex::Coinex::new(depth), backoff)),
-        ExchangeId::Kucoin => Arc::new(WsConnector::new(kucoin::Kucoin::new(depth), backoff)),
-        ExchangeId::Phemex => Arc::new(WsConnector::new(phemex::Phemex::new(depth), backoff)),
+        ExchangeId::Bybit => wire!(bybit::Bybit::new(depth)),
+        ExchangeId::Okx => wire!(okx::Okx::new(depth)),
+        ExchangeId::Mexc => wire!(mexc::Mexc::new(depth)),
+        ExchangeId::Bitget => wire!(bitget::Bitget::new(depth)),
+        ExchangeId::Gate => wire!(gate::Gate::new(depth)),
+        ExchangeId::Coinex => wire!(coinex::Coinex::new(depth)),
+        ExchangeId::Kucoin => wire!(kucoin::Kucoin::new(depth)),
+        ExchangeId::Phemex => wire!(phemex::Phemex::new(depth)),
     }
 }

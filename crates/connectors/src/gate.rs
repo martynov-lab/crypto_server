@@ -8,9 +8,12 @@
 //!   Keepalive: {"channel":"futures.ping"}
 //!   Symbol:    "{BASE}_{QUOTE}"
 //!
-//! NOTE: book_ticker sizes are in *contracts*, not base units. Executable
-//! notional here is approximate until contract multipliers are wired. For deep
-//! books use "futures.order_book"/"futures.order_book_update" (snapshot+delta).
+//! NOTE: book_ticker sizes are in *contracts*, not base units — one BTC_USDT
+//! contract is 0.0001 BTC, one PEPE_USDT contract is 10,000,000 PEPE. The
+//! `quanto_multiplier` from universe discovery converts them centrally in
+//! `common::run_ws_exchange`, so `parse` below emits raw contract counts.
+//! Remaining imprecision: this is BBO only (1 level). For real depth switch to
+//! "futures.order_book"/"futures.order_book_update" (snapshot+delta).
 
 use crate::common::{SymbolCtx, WsExchange};
 use crate::util::dec_from_json;

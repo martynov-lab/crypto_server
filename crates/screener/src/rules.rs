@@ -3,12 +3,13 @@
 //! band, depth, and transferability filters.
 
 use crate::config::ClientConfig;
-use crate::executable::{executable_spread, ExecSpread};
+use crate::executable::{executable_spread, pair_economics, ExecSpread, PairEconomics};
 use crate::funding::{best_funding_diff, FundingSignal};
 use domain::transfer::has_common_transfer_route;
 use domain::{Decimal, ExchangeId, Spread, SpreadReason, TransferStatus};
 use market_state::{ExchangeQuote, InstrumentSnapshot, SpreadStats};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use std::time::Instant;
 
 /// Read-only source of transfer status, implemented by the `transfer_status`
 /// crate. Kept as a trait so the screener has no dependency cycle and tests can
@@ -59,40 +60,83 @@ pub fn evaluate(
     }
 
     // Usable, client-enabled quotes only.
-    let quotes: Vec<_> = snapshot
+    let all_quotes: Vec<_> = snapshot
         .usable()
         .filter(|q| cfg.includes(q.exchange))
         .collect();
-    if quotes.len() < 2 {
+    if all_quotes.len() < 2 {
         return None;
     }
 
-    // Brute-force best pairing by net spread (venue count is small).
-    let mut best: Option<(usize, usize, ExecSpread)> = None;
+    // Drop venues quoting a price far from the cross-venue consensus. A wrong
+    // token, a frozen market, or a post-redenomination listing shows up as a
+    // huge "spread" that passes every economic filter, so it has to be removed
+    // before pairing rather than capped afterwards.
+    let quotes = drop_price_outliers(&all_quotes, cfg);
+    if quotes.len() < 2 {
+        // A pairing existed until consensus filtering removed it — report that
+        // explicitly instead of going silent, so the rejection is visible.
+        return outlier_rejection(snapshot, &all_quotes, cfg);
+    }
+
+    // The level the position is expected to unwind at: the instrument's rolling
+    // baseline. Clamped at zero — assuming the spread overshoots into negative
+    // territory in our favor is not something to bank on.
+    let convergence = snapshot
+        .stats
+        .as_ref()
+        .map(|s| s.baseline_pct.max(Decimal::ZERO))
+        .unwrap_or(Decimal::ZERO);
+
+    // Brute-force best pairing (venue count is small). Ranked by expected
+    // profit **in quote currency**, not percent: a 5% edge on $50 of depth is
+    // worth less than a 2% edge on $2000, and ranking by percent used to hand
+    // the tradable pair's slot to an untradable one.
+    let mut best_qualified: Option<Candidate> = None;
+    let mut best_any: Option<Candidate> = None;
     for (i, buy) in quotes.iter().enumerate() {
         for (j, sell) in quotes.iter().enumerate() {
             if i == j || buy.exchange == sell.exchange {
                 continue;
             }
-            let fee_buy = cfg.taker(buy.exchange);
-            let fee_sell = cfg.taker(sell.exchange);
-            if let Some(es) = executable_spread(
+            let funding_cost = funding_cost_pct(cfg, buy, sell);
+            let Some(econ) = pair_economics(
                 &buy.book.asks,
+                &buy.book.bids,
                 &sell.book.bids,
+                &sell.book.asks,
                 cfg.target_notional_q,
-                fee_buy,
-                fee_sell,
-            ) {
-                if best.as_ref().map_or(true, |(_, _, b)| es.net_pct > b.net_pct) {
-                    best = Some((i, j, es));
-                }
+                cfg.taker(buy.exchange),
+                cfg.taker(sell.exchange),
+                convergence,
+                funding_cost,
+            ) else {
+                continue;
+            };
+            let cand = Candidate { buy: i, sell: j, econ };
+            let better = |slot: &Option<Candidate>| {
+                slot.as_ref().map_or(true, |b| {
+                    cand.econ.expected_profit_quote > b.econ.expected_profit_quote
+                })
+            };
+            if cand.econ.entry.executable_notional >= cfg.min_executable_notional
+                && better(&best_qualified)
+            {
+                best_qualified = Some(cand.clone());
+            }
+            if better(&best_any) {
+                best_any = Some(cand);
             }
         }
     }
 
-    let (bi, sj, es) = best?;
+    // Prefer a pair that actually clears the depth floor; fall back to the best
+    // of the rest so the rejection reason is still reported.
+    let Candidate { buy: bi, sell: sj, econ } = best_qualified.or(best_any)?;
+    let es = econ.entry.clone();
     let buy_ex = quotes[bi].exchange;
     let sell_ex = quotes[sj].exchange;
+    let leg_skew_ms = leg_skew_ms(quotes[bi], quotes[sj]);
 
     // Funding differential signal (independent of the price spread).
     let funding = if cfg.include_funding_diff {
@@ -113,15 +157,32 @@ pub fn evaluate(
         vwap_sell: es.vwap_sell,
         gross_pct: es.gross_pct,
         net_pct: es.net_pct,
+        out_pct: econ.out_pct,
+        round_trip_pct: econ.round_trip_pct,
+        funding_cost_pct: econ.funding_cost_pct,
+        expected_profit_quote: econ.expected_profit_quote,
+        leg_skew_ms,
         executable_notional: es.executable_notional,
         capped_by_depth: es.capped_by_depth,
     };
 
     let stats = snapshot.stats.clone();
-    let reason = classify(&es, cfg, oracle, quotes[bi], quotes[sj], stats.as_ref());
-    let quality_score = stats
-        .as_ref()
-        .map(|st| quality_score(st, quotes.len(), cfg.max_spread_duration_ms));
+    let reason = classify(
+        &econ,
+        leg_skew_ms,
+        cfg,
+        oracle,
+        quotes[bi],
+        quotes[sj],
+        stats.as_ref(),
+    );
+    let quality_score = Some(quality_score(
+        &econ,
+        leg_skew_ms,
+        stats.as_ref(),
+        quotes.len(),
+        cfg,
+    ));
     Some(Evaluation {
         spread,
         reason,
@@ -131,33 +192,197 @@ pub fn evaluate(
     })
 }
 
-/// Apply band, depth, liquidity, dynamics, and transfer filters to a best pairing.
+/// One candidate pairing under evaluation.
+#[derive(Debug, Clone)]
+struct Candidate {
+    /// Indices into the filtered quote list.
+    buy: usize,
+    sell: usize,
+    econ: PairEconomics,
+}
+
+/// Funding carried by the pair over the assumed hold: the long leg pays its own
+/// funding, the short leg collects the other venue's. Positive is a cost.
+/// Missing funding data counts as zero for that leg.
+fn funding_cost_pct(cfg: &ClientConfig, buy_q: &ExchangeQuote, sell_q: &ExchangeQuote) -> Decimal {
+    if !cfg.include_funding_cost {
+        return Decimal::ZERO;
+    }
+    let hours = cfg.funding_hold_hours;
+    let long = buy_q
+        .funding
+        .as_ref()
+        .map_or(Decimal::ZERO, |f| f.cost_over(hours));
+    let short = sell_q
+        .funding
+        .as_ref()
+        .map_or(Decimal::ZERO, |f| f.cost_over(hours));
+    long - short
+}
+
+/// How far apart in time the two legs' books were received.
+fn leg_skew_ms(buy_q: &ExchangeQuote, sell_q: &ExchangeQuote) -> u64 {
+    let (a, b) = (buy_q.book.recv_ts, sell_q.book.recv_ts);
+    let older: Instant = a.min(b);
+    let newer: Instant = a.max(b);
+    newer.saturating_duration_since(older).as_millis() as u64
+}
+
+/// Mid price of a quote, used only for the cross-venue consensus check.
+fn mid(q: &ExchangeQuote) -> Option<Decimal> {
+    let (bid, ask) = (q.book.best_bid()?, q.book.best_ask()?);
+    let m = (bid.price + ask.price) / Decimal::TWO;
+    (m > Decimal::ZERO).then_some(m)
+}
+
+/// Median of the venues' mid prices — the consensus price for the instrument.
+fn consensus_mid(quotes: &[&ExchangeQuote]) -> Option<Decimal> {
+    let mut mids: Vec<Decimal> = quotes.iter().filter_map(|q| mid(q)).collect();
+    if mids.is_empty() {
+        return None;
+    }
+    mids.sort();
+    let n = mids.len();
+    Some(if n % 2 == 1 {
+        mids[n / 2]
+    } else {
+        (mids[n / 2 - 1] + mids[n / 2]) / Decimal::TWO
+    })
+}
+
+/// Remove venues whose mid deviates from the consensus by more than
+/// `max_price_deviation_pct`. With the check disabled, or without a consensus,
+/// every quote is kept.
+///
+/// Requires at least three venues: with two, the median is just their midpoint
+/// and *both* sides of any wide spread look equally deviant — a legitimate 25%
+/// dislocation would be thrown away along with the ghosts. Two-venue pairings
+/// are left to `max_net_spread_pct` instead.
+fn drop_price_outliers<'a>(
+    quotes: &[&'a ExchangeQuote],
+    cfg: &ClientConfig,
+) -> Vec<&'a ExchangeQuote> {
+    if quotes.len() < 3 {
+        return quotes.to_vec();
+    }
+    let Some(max_dev) = cfg.max_price_deviation_pct else {
+        return quotes.to_vec();
+    };
+    let Some(consensus) = consensus_mid(quotes) else {
+        return quotes.to_vec();
+    };
+    quotes
+        .iter()
+        .copied()
+        .filter(|q| match mid(q) {
+            Some(m) => ((m - consensus) / consensus).abs() <= max_dev,
+            None => false,
+        })
+        .collect()
+}
+
+/// Report a `PriceOutlier` rejection for the raw (pre-filter) best pairing, so
+/// a consensus-driven drop is explained rather than silently swallowed.
+fn outlier_rejection(
+    snapshot: &InstrumentSnapshot,
+    quotes: &[&ExchangeQuote],
+    cfg: &ClientConfig,
+) -> Option<Evaluation> {
+    let mut best: Option<(ExchangeId, ExchangeId, ExecSpread)> = None;
+    for (i, buy) in quotes.iter().enumerate() {
+        for (j, sell) in quotes.iter().enumerate() {
+            if i == j || buy.exchange == sell.exchange {
+                continue;
+            }
+            if let Some(es) = executable_spread(
+                &buy.book.asks,
+                &sell.book.bids,
+                cfg.target_notional_q,
+                cfg.taker(buy.exchange),
+                cfg.taker(sell.exchange),
+            ) {
+                if best.as_ref().map_or(true, |(_, _, b)| es.net_pct > b.net_pct) {
+                    best = Some((buy.exchange, sell.exchange, es));
+                }
+            }
+        }
+    }
+    let (buy_ex, sell_ex, es) = best?;
+    Some(Evaluation {
+        spread: Spread {
+            instrument: snapshot.instrument.clone(),
+            buy_exchange: buy_ex,
+            sell_exchange: sell_ex,
+            vwap_buy: es.vwap_buy,
+            vwap_sell: es.vwap_sell,
+            gross_pct: es.gross_pct,
+            net_pct: es.net_pct,
+            out_pct: Decimal::ZERO,
+            round_trip_pct: Decimal::ZERO,
+            funding_cost_pct: Decimal::ZERO,
+            expected_profit_quote: Decimal::ZERO,
+            leg_skew_ms: 0,
+            executable_notional: es.executable_notional,
+            capped_by_depth: es.capped_by_depth,
+        },
+        reason: SpreadReason::PriceOutlier,
+        funding: None,
+        stats: snapshot.stats.clone(),
+        quality_score: None,
+    })
+}
+
+/// Apply timing, band, round-trip, depth, liquidity, dynamics, and transfer
+/// filters to a best pairing. Ordered cheapest-and-most-decisive first.
+#[allow(clippy::too_many_arguments)]
 fn classify(
-    es: &ExecSpread,
+    econ: &PairEconomics,
+    leg_skew_ms: u64,
     cfg: &ClientConfig,
     oracle: &dyn TransferOracle,
     buy_q: &ExchangeQuote,
     sell_q: &ExchangeQuote,
     stats: Option<&SpreadStats>,
 ) -> SpreadReason {
+    let es = &econ.entry;
     let buy_ex = buy_q.exchange;
     let sell_ex = sell_q.exchange;
+
+    // The band goes first: a pairing with no edge is not an opportunity for any
+    // reason, and reporting a data-quality reason for it would drown the
+    // rejection metrics in pairs nobody would trade anyway.
     if es.net_pct < cfg.min_net_spread_pct {
         return SpreadReason::BelowMinSpread;
     }
     if es.net_pct > cfg.max_net_spread_pct {
         return SpreadReason::AboveMaxSpread; // ghost/delisted territory
     }
+    // Both books can be individually fresh yet describe different moments.
+    if cfg.max_leg_skew_ms > 0 && leg_skew_ms > cfg.max_leg_skew_ms {
+        return SpreadReason::LegSkew;
+    }
+    // The entry edge has to survive the unwind: two more taker fees, the
+    // funding carry, and the fact that the spread only converges to its
+    // baseline rather than to zero.
+    if econ.round_trip_pct < cfg.min_round_trip_pct {
+        return SpreadReason::NegativeRoundTrip;
+    }
     if es.executable_notional < cfg.min_executable_notional {
         return SpreadReason::InsufficientDepth;
     }
-    // Liquidity band. Applied against the higher of the two legs' reported
-    // figures; skipped when neither venue reports the metric (unknown).
-    if let Some(vol) = max_opt(buy_q.quote_volume_24h, sell_q.quote_volume_24h) {
-        if cfg.min_24h_quote_volume > Decimal::ZERO && vol < cfg.min_24h_quote_volume {
-            return SpreadReason::BelowMinVolume;
+    // Liquidity band. The floor applies to the **thinner** leg — that leg is
+    // the bottleneck for getting filled — while the ceiling applies to the
+    // thicker one, so "both venues are small" is what keeps a coin in a low-cap
+    // band. Skipped for whichever bound no venue reports.
+    if cfg.min_24h_quote_volume > Decimal::ZERO {
+        if let Some(vol) = min_opt(buy_q.quote_volume_24h, sell_q.quote_volume_24h) {
+            if vol < cfg.min_24h_quote_volume {
+                return SpreadReason::BelowMinVolume;
+            }
         }
-        if let Some(max_vol) = cfg.max_24h_quote_volume {
+    }
+    if let Some(max_vol) = cfg.max_24h_quote_volume {
+        if let Some(vol) = max_opt(buy_q.quote_volume_24h, sell_q.quote_volume_24h) {
             if vol > max_vol {
                 return SpreadReason::AboveMaxVolume;
             }
@@ -165,7 +390,7 @@ fn classify(
     }
     if let Some(min_oi) = cfg.min_open_interest {
         if min_oi > Decimal::ZERO {
-            if let Some(oi) = max_opt(buy_q.open_interest, sell_q.open_interest) {
+            if let Some(oi) = min_opt(buy_q.open_interest, sell_q.open_interest) {
                 if oi < min_oi {
                     return SpreadReason::BelowMinOpenInterest;
                 }
@@ -173,14 +398,17 @@ fn classify(
         }
     }
     // Spread-dynamics filters: reject persistently-wide, non-spike, or too-long
-    // episodes once enough history exists (skip during warmup).
+    // episodes once enough *baseline* history exists (skip during warmup).
     if cfg.enable_dynamics {
         if let Some(st) = stats {
-            if st.sample_count >= cfg.min_dynamics_samples as usize {
+            if st.baseline_samples >= cfg.min_dynamics_samples as usize {
                 if st.baseline_pct > cfg.max_baseline_spread_pct {
                     return SpreadReason::PersistentWide;
                 }
-                match st.z_score {
+                // Score *this* client's spread, not the shared history's last
+                // sample — fees differ per client, so the two are not the same
+                // number and filtering on the wrong one rejects good signals.
+                match st.z_for(es.net_pct) {
                     Some(z) if z >= cfg.min_spike_z => {}
                     _ => return SpreadReason::NotASpike,
                 }
@@ -206,20 +434,62 @@ fn max_opt(a: Option<Decimal>, b: Option<Decimal>) -> Option<Decimal> {
     }
 }
 
-/// 0–100 arb-quality score: rewards a tight baseline, a strong current spike,
-/// short episode duration, and broad venue coverage.
-fn quality_score(stats: &SpreadStats, coverage: usize, max_dur_ms: u64) -> Decimal {
-    let clamp01 = |x: f64| x.clamp(0.0, 1.0);
-    let baseline = stats.baseline_pct.to_f64().unwrap_or(0.0);
-    let z = stats.z_score.and_then(|d| d.to_f64()).unwrap_or(0.0);
-    let episode = stats.episode_ms as f64;
+/// Min of two optional decimals; `None` only when both are `None`.
+fn min_opt(a: Option<Decimal>, b: Option<Decimal>) -> Option<Decimal> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
 
-    let tightness = clamp01(1.0 - baseline / 0.02); // baseline 0 → 1, ≥2% → 0
-    let spike = clamp01(z / 6.0);
-    let transience = clamp01(1.0 - episode / (max_dur_ms.max(1) as f64));
+/// 0–100 arb-quality score for ranking signals against each other.
+///
+/// Unlike the earlier version this is dominated by the things that decide
+/// whether the trade makes money — the round-trip edge and the depth behind it
+/// — with the baseline/spike shape and data quality as modifiers.
+fn quality_score(
+    econ: &PairEconomics,
+    leg_skew_ms: u64,
+    stats: Option<&SpreadStats>,
+    coverage: usize,
+    cfg: &ClientConfig,
+) -> Decimal {
+    let clamp01 = |x: f64| x.clamp(0.0, 1.0);
+    let f = |d: Decimal| d.to_f64().unwrap_or(0.0);
+
+    // Edge: the round-trip profit, saturating at 1%.
+    let edge = clamp01(f(econ.round_trip_pct) / 0.01);
+    // Depth: how much of the requested size the books actually support.
+    let target = f(cfg.target_notional_q).max(1.0);
+    let depth = clamp01(f(econ.entry.executable_notional) / target);
+    // Freshness: how simultaneous the two legs were.
+    let skew_budget = cfg.max_leg_skew_ms.max(1) as f64;
+    let freshness = clamp01(1.0 - leg_skew_ms as f64 / skew_budget);
     let cov = clamp01(coverage as f64 / 4.0);
 
-    let score = 100.0 * (0.35 * tightness + 0.30 * spike + 0.20 * transience + 0.15 * cov);
+    // Shape: a tight baseline punctuated by a strong spike. Neutral (0.5) until
+    // enough history exists to say anything.
+    let (tightness, spike) = match stats {
+        Some(st) if st.baseline_samples >= cfg.min_dynamics_samples as usize => {
+            let max_base = f(cfg.max_baseline_spread_pct).max(1e-9);
+            let z = st.z_for(econ.entry.net_pct).map(f).unwrap_or(0.0);
+            (
+                clamp01(1.0 - f(st.baseline_pct) / max_base),
+                clamp01(z / (f(cfg.min_spike_z).max(1e-9) * 2.0)),
+            )
+        }
+        _ => (0.5, 0.5),
+    };
+
+    let score = 100.0
+        * (0.30 * edge
+            + 0.20 * depth
+            + 0.20 * spike
+            + 0.15 * tightness
+            + 0.10 * freshness
+            + 0.05 * cov);
     Decimal::from_f64(score).unwrap_or_default().round_dp(1)
 }
 
@@ -265,10 +535,13 @@ pub fn best_spread_point(
     cfg: &ClientConfig,
     ts_ms: i64,
 ) -> Option<domain::SpreadPoint> {
-    let quotes: Vec<_> = snapshot
+    let all: Vec<_> = snapshot
         .usable()
         .filter(|q| cfg.includes(q.exchange))
         .collect();
+    // Consensus filtering matters most here: this series feeds the rolling
+    // baseline, and one wrong-token venue would poison it for every client.
+    let quotes = drop_price_outliers(&all, cfg);
     if quotes.len() < 2 {
         return None;
     }
@@ -276,6 +549,9 @@ pub fn best_spread_point(
     for (i, buy) in quotes.iter().enumerate() {
         for (j, sell) in quotes.iter().enumerate() {
             if i == j || buy.exchange == sell.exchange {
+                continue;
+            }
+            if cfg.max_leg_skew_ms > 0 && leg_skew_ms(buy, sell) > cfg.max_leg_skew_ms {
                 continue;
             }
             if let Some(es) = executable_spread(
@@ -341,11 +617,15 @@ pub fn summary_row(
             .find(|q| q.exchange == ex)
             .and_then(|q| q.quote_volume_24h)
     };
-    if let Some(vol) = max_opt(leg_vol(buy), leg_vol(sell)) {
-        if cfg.min_24h_quote_volume > Decimal::ZERO && vol < cfg.min_24h_quote_volume {
-            return None;
+    if cfg.min_24h_quote_volume > Decimal::ZERO {
+        if let Some(vol) = min_opt(leg_vol(buy), leg_vol(sell)) {
+            if vol < cfg.min_24h_quote_volume {
+                return None;
+            }
         }
-        if let Some(max_vol) = cfg.max_24h_quote_volume {
+    }
+    if let Some(max_vol) = cfg.max_24h_quote_volume {
+        if let Some(vol) = max_opt(leg_vol(buy), leg_vol(sell)) {
             if vol > max_vol {
                 return None;
             }
@@ -360,27 +640,55 @@ mod tests {
     use domain::{BookLevel, Instrument, TopBook};
     use market_state::InstrumentSnapshot;
     use rust_decimal_macros::dec;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn book(bid: Decimal, ask: Decimal) -> TopBook {
+        book_full(bid, ask, dec!(1000), Instant::now())
+    }
+
+    fn book_full(bid: Decimal, ask: Decimal, qty: Decimal, recv_ts: Instant) -> TopBook {
         TopBook {
-            bids: vec![BookLevel::new(bid, dec!(1000))],
-            asks: vec![BookLevel::new(ask, dec!(1000))],
-            recv_ts: Instant::now(),
+            bids: vec![BookLevel::new(bid, qty)],
+            asks: vec![BookLevel::new(ask, qty)],
+            recv_ts,
             exch_ts: None,
         }
     }
 
     fn quote(ex: ExchangeId, bid: Decimal, ask: Decimal, vol: Option<Decimal>) -> ExchangeQuote {
+        from_book(ex, book(bid, ask), vol)
+    }
+
+    fn from_book(ex: ExchangeId, book: TopBook, vol: Option<Decimal>) -> ExchangeQuote {
         ExchangeQuote {
             exchange: ex,
-            book: book(bid, ask),
+            book,
             funding: None,
             quote_volume_24h: vol,
             open_interest: None,
             stale: false,
             valid: true,
         }
+    }
+
+    /// Snapshot from an explicit quote list, with the in-band default volume.
+    fn snapshot_of(quotes: Vec<ExchangeQuote>) -> InstrumentSnapshot {
+        InstrumentSnapshot {
+            instrument: Instrument::perp("XYZ", "USDT"),
+            quotes,
+            stats: None,
+        }
+    }
+
+    fn eval_cfg() -> ClientConfig {
+        let mut c = ClientConfig::default();
+        c.require_transferable = false;
+        c.require_common_network = false;
+        c
+    }
+
+    fn reason_of(snap: &InstrumentSnapshot, cfg: &ClientConfig) -> SpreadReason {
+        evaluate(snap, cfg, &NoTransferInfo).expect("a candidate").reason
     }
 
     /// buy on Bybit at `cheap_ask`, sell on OKX at `rich_bid`.
@@ -438,6 +746,154 @@ mod tests {
         assert!(summary_row(&snap, &cfg()).is_none());
         snap.quotes[0].quote_volume_24h = None; // unknown on both legs => skipped
         assert!(summary_row(&snap, &cfg()).is_some());
+    }
+
+    /// An entry spread that clears the band can still lose money once the
+    /// unwind's two extra taker fees are charged.
+    #[test]
+    fn round_trip_rejects_a_fee_thin_edge() {
+        let mut c = eval_cfg();
+        c.min_net_spread_pct = dec!(0.001); // let the thin edge past the band
+        // gross 0.25%, entry net 0.13%, round trip 0.01% — below the floor.
+        let snap = snapshot_of(vec![
+            quote(ExchangeId::Bybit, dec!(99.9), dec!(100), Some(dec!(150000))),
+            quote(ExchangeId::Okx, dec!(100.25), dec!(100.35), Some(dec!(150000))),
+        ]);
+        assert_eq!(reason_of(&snap, &c), SpreadReason::NegativeRoundTrip);
+
+        let ev = evaluate(&snap, &c, &NoTransferInfo).unwrap();
+        assert!(ev.spread.net_pct > dec!(0), "the entry alone looks fine");
+        assert!(ev.spread.round_trip_pct < ev.spread.net_pct);
+        assert!(ev.spread.out_pct < dec!(0));
+    }
+
+    /// Funding carry is part of the trade's economics, not a separate signal.
+    #[test]
+    fn funding_carry_is_charged_against_the_edge() {
+        use domain::FundingInfo;
+        let mut long_leg = quote(ExchangeId::Bybit, dec!(99.9), dec!(100), Some(dec!(150000)));
+        // Long leg pays 1% per 8h interval over an 8h hold.
+        long_leg.funding = Some(FundingInfo {
+            rate: dec!(0.01),
+            interval_hours: dec!(8),
+            next_ts: 0,
+        });
+        let snap = snapshot_of(vec![
+            long_leg,
+            quote(ExchangeId::Okx, dec!(106), dec!(106.1), Some(dec!(150000))),
+        ]);
+
+        let mut c = eval_cfg();
+        let with_cost = evaluate(&snap, &c, &NoTransferInfo).unwrap();
+        c.include_funding_cost = false;
+        let without = evaluate(&snap, &c, &NoTransferInfo).unwrap();
+
+        assert_eq!(with_cost.spread.funding_cost_pct, dec!(0.01));
+        assert_eq!(
+            with_cost.spread.round_trip_pct,
+            without.spread.round_trip_pct - dec!(0.01)
+        );
+    }
+
+    /// Ranking by percent handed the slot to a pair nobody could trade. The
+    /// wide-but-empty pairing must lose to the narrower one with real depth.
+    #[test]
+    fn ranks_pairs_by_expected_profit_not_percent() {
+        let vol = Some(dec!(150000));
+        let snap = snapshot_of(vec![
+            from_book(
+                ExchangeId::Bybit,
+                book_full(dec!(99.9), dec!(100), dec!(1000), Instant::now()),
+                vol,
+            ),
+            // 6% away, but only ~$53 of depth behind the bid.
+            from_book(
+                ExchangeId::Okx,
+                book_full(dec!(106), dec!(106.1), dec!(0.5), Instant::now()),
+                vol,
+            ),
+            // 2% away with the full target size available.
+            from_book(
+                ExchangeId::Mexc,
+                book_full(dec!(102), dec!(102.1), dec!(1000), Instant::now()),
+                vol,
+            ),
+        ]);
+        let ev = evaluate(&snap, &eval_cfg(), &NoTransferInfo).unwrap();
+        assert_eq!(ev.reason, SpreadReason::Signal);
+        assert_eq!(ev.spread.buy_exchange, ExchangeId::Bybit);
+        assert_eq!(
+            ev.spread.sell_exchange,
+            ExchangeId::Mexc,
+            "the tradable pair must win over the wider empty one"
+        );
+        assert!(ev.spread.expected_profit_quote > dec!(0));
+    }
+
+    /// Two individually-fresh books observed seconds apart never coexisted.
+    #[test]
+    fn legs_observed_far_apart_are_rejected() {
+        let now = Instant::now();
+        let snap = snapshot_of(vec![
+            from_book(
+                ExchangeId::Bybit,
+                book_full(dec!(99.9), dec!(100), dec!(1000), now - Duration::from_millis(2000)),
+                Some(dec!(150000)),
+            ),
+            from_book(
+                ExchangeId::Okx,
+                book_full(dec!(106), dec!(106.1), dec!(1000), now),
+                Some(dec!(150000)),
+            ),
+        ]);
+        let ev = evaluate(&snap, &eval_cfg(), &NoTransferInfo).unwrap();
+        assert_eq!(ev.reason, SpreadReason::LegSkew);
+        assert!(ev.spread.leg_skew_ms >= 2000);
+    }
+
+    /// A venue quoting a different token entirely must be dropped before
+    /// pairing, not merely capped by the spread band afterwards.
+    #[test]
+    fn wrong_token_venue_is_dropped_from_the_consensus() {
+        let vol = Some(dec!(150000));
+        let snap = snapshot_of(vec![
+            quote(ExchangeId::Bybit, dec!(99.9), dec!(100), vol),
+            quote(ExchangeId::Okx, dec!(100.5), dec!(100.6), vol),
+            // 3x the consensus price — a different asset under the same base.
+            quote(ExchangeId::Mexc, dec!(300), dec!(300.1), vol),
+        ]);
+        let ev = evaluate(&snap, &eval_cfg(), &NoTransferInfo).unwrap();
+        assert_ne!(ev.spread.buy_exchange, ExchangeId::Mexc);
+        assert_ne!(ev.spread.sell_exchange, ExchangeId::Mexc);
+        assert!(
+            ev.spread.gross_pct < dec!(0.02),
+            "only the two consensus venues should pair"
+        );
+    }
+
+    /// Fewer than three venues carries no consensus, so a legitimate wide
+    /// spread must survive.
+    #[test]
+    fn two_venue_wide_spread_is_not_treated_as_an_outlier() {
+        let snap = snapshot_of(vec![
+            quote(ExchangeId::Bybit, dec!(99.9), dec!(100), Some(dec!(150000))),
+            quote(ExchangeId::Okx, dec!(122), dec!(122.1), Some(dec!(150000))),
+        ]);
+        assert_eq!(reason_of(&snap, &eval_cfg()), SpreadReason::Signal);
+    }
+
+    /// The volume floor guards fillability, so it belongs on the *thinner* leg
+    /// — the bottleneck — not on whichever leg happens to be busiest.
+    #[test]
+    fn volume_floor_applies_to_the_thinner_leg() {
+        let mut c = eval_cfg();
+        c.max_24h_quote_volume = None;
+        c.min_24h_quote_volume = dec!(100000);
+        let snap = snapshot_of(vec![
+            quote(ExchangeId::Bybit, dec!(99.9), dec!(100), Some(dec!(5000000))),
+            quote(ExchangeId::Okx, dec!(106), dec!(106.1), Some(dec!(50000))),
+        ]);
+        assert_eq!(reason_of(&snap, &c), SpreadReason::BelowMinVolume);
     }
 
     #[test]

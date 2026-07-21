@@ -58,6 +58,7 @@ pub struct ClientConfig {
     pub min_open_interest: Option<Decimal>,
 
     // --- Spread band (the 0.6%..25% control) ---
+    /// Floor on the **entry** spread (net of the two entry taker fees).
     pub min_net_spread_pct: Decimal,
     /// Caps ghost spreads (delisted/frozen/wrong-token) that masquerade as huge edges.
     pub max_net_spread_pct: Decimal,
@@ -67,6 +68,10 @@ pub struct ClientConfig {
     pub min_executable_notional: Decimal,
     /// Book levels to walk for VWAP.
     pub depth_levels_n: u32,
+    /// Floor on the **round-trip** edge: the entry spread minus the expected
+    /// unwind level, four taker fees, and the funding carry. This is the real
+    /// profitability gate — `min_net_spread_pct` only bounds the entry.
+    pub min_round_trip_pct: Decimal,
 
     // --- Fees / funding ---
     /// Per-exchange taker fee fractions.
@@ -74,7 +79,12 @@ pub struct ClientConfig {
     pub include_funding_diff: bool,
     /// Minimum annualized funding differential to surface as a funding signal.
     pub min_funding_diff_apr: Decimal,
+    /// Assumed holding period, used both to annualize the funding signal and to
+    /// charge the position's funding carry against the round-trip edge.
     pub funding_hold_hours: Decimal,
+    /// Subtract the expected funding carry from the round-trip edge. A perp
+    /// pair pays funding on both legs while it waits for convergence.
+    pub include_funding_cost: bool,
 
     // --- Reality filters (mirage killers) ---
     /// Settlement asset must be deposit+withdraw enabled on both legs.
@@ -83,6 +93,14 @@ pub struct ClientConfig {
     pub require_common_network: bool,
     /// Books older than this (ms) are excluded.
     pub max_book_age_ms: u64,
+    /// Maximum age difference between the two legs' books. Both legs can be
+    /// individually "fresh" yet describe moments far enough apart that the
+    /// spread between them never existed; this bounds that skew.
+    pub max_leg_skew_ms: u64,
+    /// Reject a venue whose mid price deviates from the cross-venue median by
+    /// more than this fraction — the signature of a wrong token, a frozen
+    /// market, or a redenomination. `None` disables the check.
+    pub max_price_deviation_pct: Option<Decimal>,
 
     // --- Spread dynamics (tight-baseline-with-spikes detection) ---
     /// Master switch for the dynamics filters below.
@@ -108,6 +126,11 @@ pub struct ClientConfig {
 
     // --- Noise control ---
     pub hysteresis_step_pct: Decimal,
+    /// Consecutive rejected evaluations required before an open episode is
+    /// considered closed and hysteresis resets. Without this, a single tick
+    /// that grazes a filter boundary re-arms the engine and the same
+    /// opportunity alerts again on the next tick.
+    pub episode_close_ticks: u32,
     pub min_signal_lifetime_ms: u64,
     pub cooldown_ms: u64,
     pub max_signals_per_min: Option<u32>,
@@ -129,16 +152,20 @@ impl Default for ClientConfig {
             target_notional_q: dec_lit("2000"),
             min_executable_notional: dec_lit("500"),
             depth_levels_n: 20,
+            min_round_trip_pct: dec_lit("0.001"),
             taker_fee: HashMap::new(),
             include_funding_diff: true,
             min_funding_diff_apr: dec_lit("0.15"),
             funding_hold_hours: dec_lit("8"),
+            include_funding_cost: true,
             // Off by default: Phase-1 transfer data is public-only and partial
             // (see config/default.toml). Clients opt in once the store is
             // populated for their venues.
             require_transferable: false,
             require_common_network: false,
             max_book_age_ms: 3000,
+            max_leg_skew_ms: 750,
+            max_price_deviation_pct: Some(dec_lit("0.10")),
             enable_dynamics: true,
             max_baseline_spread_pct: dec_lit("0.01"),
             min_spike_z: dec_lit("3"),
@@ -146,6 +173,7 @@ impl Default for ClientConfig {
             min_dynamics_samples: 20,
             max_chart_spread_pct: dec_lit("0.50"),
             hysteresis_step_pct: dec_lit("0.005"),
+            episode_close_ticks: 3,
             min_signal_lifetime_ms: 1500,
             cooldown_ms: 2000,
             max_signals_per_min: Some(120),

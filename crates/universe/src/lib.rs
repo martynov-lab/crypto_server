@@ -9,36 +9,64 @@ pub mod fetchers;
 pub mod poller;
 
 use dashmap::DashMap;
-use domain::ExchangeId;
-use std::collections::HashSet;
+use domain::{Decimal, ExchangeId};
+use fetchers::Listing;
+use std::collections::{HashMap, HashSet};
 
-/// Concurrent catalog of `base -> set of venues listing {base}/USDT perp`.
+/// Concurrent catalog of `base -> set of venues listing {base}/USDT perp`, plus
+/// each venue's contract size for that base.
 #[derive(Default)]
 pub struct UniverseStore {
     listings: DashMap<String, HashSet<ExchangeId>>,
+    /// `(exchange, base) -> base units per contract`. Only venues that quote
+    /// book sizes in contracts have anything other than 1 here.
+    sizes: DashMap<(ExchangeId, String), Decimal>,
 }
 
 impl UniverseStore {
     pub fn new() -> Self {
         UniverseStore {
             listings: DashMap::new(),
+            sizes: DashMap::new(),
         }
     }
 
-    /// Replace one exchange's listed bases (idempotent per refresh).
-    pub fn set_exchange(&self, exchange: ExchangeId, bases: &[String]) {
+    /// Replace one exchange's listings (idempotent per refresh).
+    pub fn set_exchange(&self, exchange: ExchangeId, listings: &[Listing]) {
         // Remove this exchange from every base first, then re-add.
         for mut e in self.listings.iter_mut() {
             e.value_mut().remove(&exchange);
         }
-        for base in bases {
+        self.sizes.retain(|(ex, _), _| *ex != exchange);
+        for l in listings {
+            let base = l.base.to_uppercase();
             self.listings
-                .entry(base.to_uppercase())
+                .entry(base.clone())
                 .or_default()
                 .insert(exchange);
+            self.sizes.insert((exchange, base), l.contract_size);
         }
         // Drop bases now listed nowhere.
         self.listings.retain(|_, v| !v.is_empty());
+    }
+
+    /// Base units per contract for `base` on `exchange`. Defaults to `1` — an
+    /// unknown multiplier must never silently rescale a book.
+    pub fn contract_size(&self, exchange: ExchangeId, base: &str) -> Decimal {
+        self.sizes
+            .get(&(exchange, base.to_uppercase()))
+            .map(|e| *e.value())
+            .unwrap_or(Decimal::ONE)
+    }
+
+    /// All of one exchange's contract sizes, as a plain map for handing to a
+    /// connector at startup.
+    pub fn contract_sizes(&self, exchange: ExchangeId) -> HashMap<String, Decimal> {
+        self.sizes
+            .iter()
+            .filter(|e| e.key().0 == exchange)
+            .map(|e| (e.key().1.clone(), *e.value()))
+            .collect()
     }
 
     /// Bases listed on at least `min_venues` exchanges, most-covered first.
@@ -98,12 +126,59 @@ pub use poller::{run_poller, DiscoveryConfig};
 mod tests {
     use super::*;
 
+    /// Listings with the default (base-unit) contract size.
+    fn plain(bases: &[&str]) -> Vec<Listing> {
+        bases
+            .iter()
+            .map(|b| Listing {
+                base: b.to_string(),
+                contract_size: Decimal::ONE,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contract_sizes_are_per_exchange_and_default_to_one() {
+        let store = UniverseStore::new();
+        store.set_exchange(
+            ExchangeId::Gate,
+            &[Listing {
+                base: "PEPE".into(),
+                contract_size: Decimal::from(10_000_000),
+            }],
+        );
+        store.set_exchange(ExchangeId::Bybit, &plain(&["PEPE"]));
+
+        assert_eq!(
+            store.contract_size(ExchangeId::Gate, "pepe"),
+            Decimal::from(10_000_000)
+        );
+        assert_eq!(store.contract_size(ExchangeId::Bybit, "PEPE"), Decimal::ONE);
+        // Never-seen pairs must not scale.
+        assert_eq!(store.contract_size(ExchangeId::Okx, "PEPE"), Decimal::ONE);
+    }
+
+    #[test]
+    fn refresh_replaces_an_exchanges_sizes() {
+        let store = UniverseStore::new();
+        store.set_exchange(
+            ExchangeId::Gate,
+            &[Listing {
+                base: "AAA".into(),
+                contract_size: Decimal::from(100),
+            }],
+        );
+        // AAA delisted, BBB listed: the stale multiplier must not linger.
+        store.set_exchange(ExchangeId::Gate, &plain(&["BBB"]));
+        assert_eq!(store.contract_size(ExchangeId::Gate, "AAA"), Decimal::ONE);
+    }
+
     #[test]
     fn anchored_requires_anchor_listing_and_a_counterparty() {
         let store = UniverseStore::new();
-        store.set_exchange(ExchangeId::Bybit, &["BTC".into(), "AAA".into(), "SOLO".into()]);
-        store.set_exchange(ExchangeId::Okx, &["BTC".into(), "AAA".into(), "XYZ".into()]);
-        store.set_exchange(ExchangeId::Gate, &["AAA".into(), "XYZ".into()]);
+        store.set_exchange(ExchangeId::Bybit, &plain(&["BTC", "AAA", "SOLO"]));
+        store.set_exchange(ExchangeId::Okx, &plain(&["BTC", "AAA", "XYZ"]));
+        store.set_exchange(ExchangeId::Gate, &plain(&["AAA", "XYZ"]));
 
         // XYZ is on 2 venues but not on the anchor; SOLO is anchor-only.
         let anchored = store.screenable_anchored(ExchangeId::Bybit, 2);

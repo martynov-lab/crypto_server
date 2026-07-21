@@ -5,7 +5,7 @@
 //! provides the whole connection lifecycle so per-exchange files only describe
 //! *what* to subscribe to and *how* to parse — never the reconnect plumbing.
 
-use domain::{ExchangeId, Instrument, MarketUpdate};
+use domain::{Decimal, ExchangeId, Instrument, MarketUpdate};
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use std::collections::HashMap;
@@ -20,11 +20,41 @@ use tracing::{debug, info, warn};
 /// guess where the base/quote split lands.
 pub struct SymbolCtx {
     by_exch: HashMap<String, Instrument>,
+    /// Canonical base → base units per contract on this venue.
+    contract_sizes: HashMap<String, Decimal>,
 }
 
 impl SymbolCtx {
     pub fn lookup(&self, exch_symbol: &str) -> Option<&Instrument> {
         self.by_exch.get(exch_symbol)
+    }
+
+    /// Base units represented by one contract of `inst` on this venue. `1` when
+    /// the venue quotes book sizes in base units or the size is unknown.
+    pub fn contract_size(&self, inst: &Instrument) -> Decimal {
+        self.contract_sizes
+            .get(&inst.base)
+            .copied()
+            .unwrap_or(Decimal::ONE)
+    }
+}
+
+/// Convert a parsed book's level quantities from contracts into base units.
+///
+/// Applied centrally rather than in each connector: the per-venue `parse`
+/// implementations describe the wire format, and whether that format counts
+/// coins or contracts is a property of the venue's contract spec, which
+/// discovery already knows. A multiplier of 1 leaves the book untouched.
+fn to_base_units(update: &mut MarketUpdate, ctx: &SymbolCtx) {
+    let MarketUpdate::Book { instrument, book, .. } = update else {
+        return;
+    };
+    let mult = ctx.contract_size(instrument);
+    if mult == Decimal::ONE {
+        return;
+    }
+    for lvl in book.bids.iter_mut().chain(book.asks.iter_mut()) {
+        lvl.qty *= mult;
     }
 }
 
@@ -131,12 +161,14 @@ pub async fn run_ws_exchange<E: WsExchange>(
     symbols: Vec<Instrument>,
     tx: mpsc::Sender<MarketUpdate>,
     mut backoff: Backoff,
+    contract_sizes: HashMap<String, Decimal>,
 ) -> anyhow::Result<()> {
     let ctx = SymbolCtx {
         by_exch: symbols
             .iter()
             .map(|i| (exchange.to_symbol(i), i.clone()))
             .collect(),
+        contract_sizes,
     };
     let id = exchange.id();
 
@@ -218,7 +250,8 @@ async fn connect_once<E: WsExchange>(
                 };
                 match msg? {
                     Message::Text(txt) => {
-                        for upd in exchange.parse(&txt, ctx) {
+                        for mut upd in exchange.parse(&txt, ctx) {
+                            to_base_units(&mut upd, ctx);
                             if tx.send(upd).await.is_err() {
                                 return Ok(started.elapsed()); // consumer gone
                             }
@@ -227,7 +260,8 @@ async fn connect_once<E: WsExchange>(
                     Message::Binary(bin) => {
                         // Some venues send text-as-binary; try UTF-8, ignore otherwise.
                         if let Ok(txt) = std::str::from_utf8(&bin) {
-                            for upd in exchange.parse(txt, ctx) {
+                            for mut upd in exchange.parse(txt, ctx) {
+                                to_base_units(&mut upd, ctx);
                                 if tx.send(upd).await.is_err() {
                                     return Ok(started.elapsed());
                                 }
@@ -249,6 +283,77 @@ async fn connect_once<E: WsExchange>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::{BookLevel, TopBook};
+    use std::time::Instant as StdInstant;
+
+    fn ctx_with(base: &str, size: Decimal) -> SymbolCtx {
+        SymbolCtx {
+            by_exch: HashMap::new(),
+            contract_sizes: HashMap::from([(base.to_string(), size)]),
+        }
+    }
+
+    fn book_update(inst: Instrument, qty: Decimal) -> MarketUpdate {
+        MarketUpdate::Book {
+            exchange: ExchangeId::Gate,
+            instrument: inst,
+            book: TopBook {
+                bids: vec![BookLevel::new(Decimal::from(10), qty)],
+                asks: vec![BookLevel::new(Decimal::from(11), qty)],
+                recv_ts: StdInstant::now(),
+                exch_ts: None,
+            },
+        }
+    }
+
+    fn qtys(update: &MarketUpdate) -> (Decimal, Decimal) {
+        let MarketUpdate::Book { book, .. } = update else {
+            panic!("expected a book update");
+        };
+        (book.bids[0].qty, book.asks[0].qty)
+    }
+
+    #[test]
+    fn contract_sizes_convert_book_levels_to_base_units() {
+        // Gate quotes 3 contracts; one contract is 1000 PEPE => 3000 PEPE.
+        let inst = Instrument::perp("PEPE", "USDT");
+        let ctx = ctx_with("PEPE", Decimal::from(1000));
+        let mut upd = book_update(inst, Decimal::from(3));
+        to_base_units(&mut upd, &ctx);
+        assert_eq!(qtys(&upd), (Decimal::from(3000), Decimal::from(3000)));
+    }
+
+    #[test]
+    fn unknown_or_unit_contract_size_leaves_the_book_alone() {
+        let inst = Instrument::perp("SOL", "USDT");
+        // No entry for SOL at all.
+        let ctx = ctx_with("PEPE", Decimal::from(1000));
+        let mut upd = book_update(inst.clone(), Decimal::from(3));
+        to_base_units(&mut upd, &ctx);
+        assert_eq!(qtys(&upd), (Decimal::from(3), Decimal::from(3)));
+
+        // Explicit multiplier of 1.
+        let ctx = ctx_with("SOL", Decimal::ONE);
+        let mut upd = book_update(inst, Decimal::from(3));
+        to_base_units(&mut upd, &ctx);
+        assert_eq!(qtys(&upd), (Decimal::from(3), Decimal::from(3)));
+    }
+
+    #[test]
+    fn non_book_updates_are_untouched() {
+        let ctx = ctx_with("PEPE", Decimal::from(1000));
+        let mut upd = MarketUpdate::Ticker {
+            exchange: ExchangeId::Gate,
+            instrument: Instrument::perp("PEPE", "USDT"),
+            quote_volume_24h: Some(Decimal::from(5)),
+            open_interest: None,
+        };
+        to_base_units(&mut upd, &ctx);
+        let MarketUpdate::Ticker { quote_volume_24h, .. } = upd else {
+            panic!("expected a ticker update");
+        };
+        assert_eq!(quote_volume_24h, Some(Decimal::from(5)));
+    }
 
     #[test]
     fn backoff_grows_then_caps() {

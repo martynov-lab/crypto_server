@@ -175,9 +175,20 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(settings.ingest.reconnect.max_backoff_ms),
         Duration::from_millis(settings.ingest.reconnect.jitter_ms),
     );
+    // Contract sizes come from the discovery snapshot taken above. They are
+    // fixed properties of each listing, and the subscribed symbol set is fixed
+    // at startup too, so a snapshot is consistent with what the connectors will
+    // actually receive.
     let connectors: Vec<_> = enabled
         .iter()
-        .map(|&id| build_connector(id, settings.ingest.depth_levels, backoff.clone()))
+        .map(|&id| {
+            build_connector(
+                id,
+                settings.ingest.depth_levels,
+                backoff.clone(),
+                universe_store.contract_sizes(id),
+            )
+        })
         .collect();
 
     // Spawn ingestion.
@@ -366,22 +377,32 @@ async fn main() -> anyhow::Result<()> {
 
 /// Print a screener signal to the terminal, mirroring the alert a subscribed
 /// client receives over WS. Reads like:
-/// `SNOW: лонг SNOWUSDT.P на Bybit, шорт SNOW_USDT на GateIoFutures — чистый
-///  спред 0,62% (без комиссий 0,72%)`.
+/// `SNOW: лонг SNOWUSDT.P на Bybit, шорт SNOW_USDT на GateIoFutures — вход
+///  0,62%, за круг 0,38% (~7,6 USDT на 2000)`.
+///
+/// The round-trip figure leads because it is the trade's actual profit; the
+/// entry spread is shown next to it so the two are never confused.
 fn log_signal(ev: &screener::ScreenerEvent) {
     let s = &ev.spread;
     // buy_exchange = lowest ask → the long leg; sell_exchange = highest bid → short.
     info!(
         target: "signal!!!!!",
-        "{}: лонг {} на {}, шорт {} на {} — чистый спред {}% (без комиссий {}%)",
+        "{}: лонг {} на {}, шорт {} на {} — вход {}%, за круг {}% (~{} USDT на {})",
         s.instrument.base,
         venue_symbol(s.buy_exchange, &s.instrument),
         venue_name(s.buy_exchange),
         venue_symbol(s.sell_exchange, &s.instrument),
         venue_name(s.sell_exchange),
         ru_pct(s.net_pct),
-        ru_pct(s.gross_pct),
+        ru_pct(s.round_trip_pct),
+        ru_dec(s.expected_profit_quote),
+        ru_dec(s.executable_notional),
     );
+}
+
+/// Format a decimal with a Russian decimal comma, rounded to 2 places.
+fn ru_dec(d: domain::Decimal) -> String {
+    d.round_dp(2).normalize().to_string().replace('.', ",")
 }
 
 /// Format a fraction (0.0062) as a Russian-locale percent string ("0,62").

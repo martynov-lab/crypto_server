@@ -34,16 +34,55 @@ impl Default for DynamicsConfig {
 }
 
 /// Computed statistics over the retained window for one instrument.
+///
+/// Baseline and dispersion are **robust** (median / MAD) and computed over the
+/// *quiet* part of the window — samples recorded before the currently-open
+/// episode. Using the plain mean and stddev over the whole window lets a spike
+/// inflate its own dispersion and mask itself, which is exactly backwards for a
+/// spike detector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpreadStats {
-    pub baseline_pct: Decimal, // median net spread
+    /// Median net spread of the quiet window — the level a position is expected
+    /// to unwind at.
+    pub baseline_pct: Decimal,
+    /// Median absolute deviation, scaled to be a stddev-equivalent.
+    pub mad_pct: Decimal,
+    /// Plain stddev over the quiet window (kept for display/compatibility).
     pub stddev_pct: Decimal,
     pub current_pct: Decimal,
-    /// (current - mean) / stddev, if stddev > 0.
+    /// Robust z-score of `current_pct` against the quiet baseline.
     pub z_score: Option<Decimal>,
     pub sample_count: usize,
+    /// Samples that fed the baseline (excludes the live episode).
+    pub baseline_samples: usize,
     /// How long the spread has continuously exceeded `reference_threshold`.
     pub episode_ms: u64,
+}
+
+/// Below this many quiet samples the episode-exclusion is abandoned and the
+/// whole window is used — a baseline from three points is worse than a slightly
+/// contaminated one.
+const MIN_QUIET_SAMPLES: usize = 8;
+
+/// Dispersion floor (5 bps) for the z-score denominator. A perfectly flat
+/// baseline has zero MAD *and* zero stddev, which would otherwise make every
+/// tick either an infinite outlier or an unmeasurable one. Flooring it means a
+/// spike is scored against a realistic minimum of quote noise.
+const MIN_DISPERSION: Decimal = Decimal::from_parts(5, 0, 0, false, 4); // 0.0005
+
+impl SpreadStats {
+    /// Robust z-score of an arbitrary spread against this instrument's quiet
+    /// baseline. Callers pass **their own** current spread (per-client fees
+    /// differ from the shared history's), rather than trusting `z_score`.
+    ///
+    /// `None` only when the window is degenerate enough to carry no signal.
+    pub fn z_for(&self, value: Decimal) -> Option<Decimal> {
+        let scale = self
+            .mad_pct
+            .max(self.stddev_pct)
+            .max(MIN_DISPERSION);
+        Some((value - self.baseline_pct) / scale)
+    }
 }
 
 struct Series {
@@ -105,48 +144,66 @@ impl SpreadHistory {
     /// Compute stats for `instrument`, or `None` if no samples yet.
     pub fn stats(&self, instrument: &Instrument, now: Instant) -> Option<SpreadStats> {
         let s = self.series.get(instrument)?;
-        if s.samples.is_empty() {
-            return None;
-        }
-        let mut vals: Vec<f64> = s
+        let all: Vec<(Instant, f64)> = s
             .samples
             .iter()
-            .filter_map(|(_, d)| d.to_f64())
+            .filter_map(|(t, d)| d.to_f64().map(|v| (*t, v)))
             .collect();
-        if vals.is_empty() {
-            return None;
-        }
-        let n = vals.len();
-        let current = *vals.last().unwrap();
+        let (_, current) = *all.last()?;
+        let total = all.len();
 
-        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = if n % 2 == 1 {
-            vals[n / 2]
-        } else {
-            (vals[n / 2 - 1] + vals[n / 2]) / 2.0
+        // Baseline over the quiet window: drop everything recorded since the
+        // current above-threshold episode opened, so a spike cannot raise the
+        // baseline it is being measured against. Fall back to the full window
+        // when that leaves too little to estimate from.
+        let mut quiet: Vec<f64> = match s.episode_open {
+            Some(open) => all.iter().filter(|(t, _)| *t < open).map(|(_, v)| *v).collect(),
+            None => all.iter().map(|(_, v)| *v).collect(),
         };
-        let mean = vals.iter().sum::<f64>() / n as f64;
-        let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
-        let stddev = variance.sqrt();
-        let z = if stddev > 0.0 {
-            Decimal::from_f64((current - mean) / stddev)
-        } else {
-            None
-        };
+        if quiet.len() < MIN_QUIET_SAMPLES {
+            quiet = all.iter().map(|(_, v)| *v).collect();
+        }
+        let baseline_samples = quiet.len();
+
+        quiet.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = median_of_sorted(&quiet);
+
+        // MAD, scaled by 1.4826 so it estimates the same quantity as stddev for
+        // normal data but ignores the outliers we are trying to detect.
+        let mut deviations: Vec<f64> = quiet.iter().map(|v| (v - median).abs()).collect();
+        deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mad = median_of_sorted(&deviations) * 1.4826;
+
+        let n = quiet.len() as f64;
+        let mean = quiet.iter().sum::<f64>() / n;
+        let stddev = (quiet.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt();
 
         let episode_ms = s
             .episode_open
             .map(|t| now.saturating_duration_since(t).as_millis() as u64)
             .unwrap_or(0);
 
-        Some(SpreadStats {
+        let stats = SpreadStats {
             baseline_pct: Decimal::from_f64(median).unwrap_or_default(),
+            mad_pct: Decimal::from_f64(mad).unwrap_or_default(),
             stddev_pct: Decimal::from_f64(stddev).unwrap_or_default(),
             current_pct: Decimal::from_f64(current).unwrap_or_default(),
-            z_score: z,
-            sample_count: n,
+            z_score: None,
+            sample_count: total,
+            baseline_samples,
             episode_ms,
-        })
+        };
+        let z_score = stats.z_for(stats.current_pct);
+        Some(SpreadStats { z_score, ..stats })
+    }
+}
+
+/// Median of an already-sorted slice; 0.0 when empty.
+fn median_of_sorted(v: &[f64]) -> f64 {
+    match v.len() {
+        0 => 0.0,
+        n if n % 2 == 1 => v[n / 2],
+        n => (v[n / 2 - 1] + v[n / 2]) / 2.0,
     }
 }
 
@@ -188,6 +245,54 @@ mod tests {
         assert_eq!(st.current_pct, dec!(0.05));
         assert!(st.z_score.unwrap() > dec!(2), "spike should be a strong outlier");
         assert!(st.sample_count >= 20);
+    }
+
+    #[test]
+    fn spike_does_not_inflate_its_own_baseline() {
+        // A sustained spike used to raise both the mean and the stddev it was
+        // measured against, so a real dislocation scored as "not a spike".
+        let h = SpreadHistory::new(cfg());
+        let inst = Instrument::perp("XYZ", "USDT");
+        let t0 = Instant::now();
+        for i in 0..40 {
+            h.record(&inst, dec!(0.003), t0 + Duration::from_millis(i));
+        }
+        // 30 consecutive ticks of a 5% spread — the episode stays open.
+        for i in 0..30 {
+            h.record(&inst, dec!(0.05), t0 + Duration::from_millis(100 + i));
+        }
+        let st = h.stats(&inst, t0 + Duration::from_millis(200)).unwrap();
+        assert_eq!(st.baseline_pct, dec!(0.003), "baseline must ignore the episode");
+        assert_eq!(st.baseline_samples, 40, "only the quiet window feeds it");
+        assert!(st.z_score.unwrap() > dec!(3), "sustained spike stays an outlier");
+    }
+
+    #[test]
+    fn z_for_scores_a_caller_supplied_spread() {
+        let h = SpreadHistory::new(cfg());
+        let inst = Instrument::perp("XYZ", "USDT");
+        let t0 = Instant::now();
+        for i in 0..20 {
+            h.record(&inst, dec!(0.003), t0 + Duration::from_millis(i));
+        }
+        let st = h.stats(&inst, t0 + Duration::from_millis(21)).unwrap();
+        // A spread at the baseline is not an outlier; one far above it is.
+        assert!(st.z_for(dec!(0.003)).unwrap() < dec!(1));
+        assert!(st.z_for(dec!(0.05)).unwrap() > dec!(3));
+    }
+
+    #[test]
+    fn flat_baseline_still_scores() {
+        // Zero MAD and zero stddev must not produce an unusable z-score.
+        let h = SpreadHistory::new(cfg());
+        let inst = Instrument::perp("XYZ", "USDT");
+        let t0 = Instant::now();
+        for i in 0..10 {
+            h.record(&inst, dec!(0.001), t0 + Duration::from_millis(i));
+        }
+        let st = h.stats(&inst, t0 + Duration::from_millis(11)).unwrap();
+        assert_eq!(st.mad_pct, dec!(0));
+        assert!(st.z_for(dec!(0.01)).is_some());
     }
 
     #[test]
