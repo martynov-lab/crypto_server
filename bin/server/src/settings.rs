@@ -46,15 +46,24 @@ impl Default for ChartCfg {
 #[derive(Debug, Deserialize)]
 pub struct ServerCfg {
     pub bind: String,
-    /// Print every screening signal (evaluated with `default_client`) to the
-    /// terminal, so the operator sees the same spread alerts a subscribed client
-    /// would — handy while setting the system up before any client connects.
+    /// Print every screening signal (evaluated with the current client config)
+    /// to the terminal, so the operator sees the same spread alerts a subscribed
+    /// client would — handy while setting the system up before any client connects.
     #[serde(default = "default_log_signals")]
     pub log_signals: bool,
+    /// Where the client's screening config is persisted. The client's
+    /// `subscribe` overwrites this file; on restart it takes precedence over
+    /// `default_client` (which then only bootstraps a fresh install).
+    #[serde(default = "default_client_config_path")]
+    pub client_config_path: String,
 }
 
 fn default_log_signals() -> bool {
     true
+}
+
+fn default_client_config_path() -> String {
+    "data/client_config.json".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +73,12 @@ pub struct IngestCfg {
     pub quote: String,
     pub depth_levels: usize,
     pub staleness_ms: u64,
+    /// Absolute freshness cap (ms) for an unchanged book on a live connection.
+    /// Event-driven feeds send nothing while a quiet coin's book doesn't move,
+    /// so such books stay usable up to this age; a frozen/delisted symbol still
+    /// goes stale once it is exceeded.
+    #[serde(default = "default_quiet_book_max_ms")]
+    pub quiet_book_max_ms: u64,
     #[serde(default)]
     pub auto_discover: bool,
     /// When set, discovery takes this exchange's coin list as the source and
@@ -75,11 +90,19 @@ pub struct IngestCfg {
     pub min_venues: usize,
     #[serde(default = "default_max_symbols")]
     pub max_symbols: usize,
+    /// Bases to screen unconditionally, on top of (and unaffected by) the
+    /// discovery ranking and the `max_symbols` cap. The answer to "why is there
+    /// no signal for coin X" when X isn't among the most-covered coins.
+    #[serde(default)]
+    pub always_screen: Vec<String>,
     #[serde(default = "default_discovery_interval")]
     pub discovery_interval_secs: u64,
     pub reconnect: ReconnectCfg,
 }
 
+fn default_quiet_book_max_ms() -> u64 {
+    30_000
+}
 fn default_min_venues() -> usize {
     2
 }
@@ -141,6 +164,7 @@ mod tests {
             .validate()
             .expect("default_client validates");
         assert_eq!(settings.default_client.market_pairs, vec![MarketPair::PERP_PERP]);
-        assert!(settings.default_client.max_24h_quote_volume.is_some());
+        // Volume ceiling is opt-in: shipped defaults screen everything above the floor.
+        assert!(settings.default_client.max_24h_quote_volume.is_none());
     }
 }

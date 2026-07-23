@@ -42,7 +42,8 @@ struct SummaryRow {
 /// Dynamics/transfer/hysteresis are not applied. Useful without opening a WS;
 /// per-client filters only apply on the WS signal stream.
 pub async fn summary(State(state): State<AppState>) -> impl IntoResponse {
-    let cfg: &ClientConfig = &state.default_cfg;
+    let cfg = state.cfg_store.get();
+    let cfg: &ClientConfig = &cfg;
     let now = Instant::now();
     let mut rows = Vec::new();
     for instrument in state.market.instruments() {
@@ -64,8 +65,14 @@ pub async fn summary(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Traded-instrument catalog: which base assets have a USDT perp on which venues.
 pub async fn instruments(State(state): State<AppState>) -> impl IntoResponse {
-    let quote = &state.default_cfg.quote;
-    Json(crate::session::build_catalog(&state.universe, quote, 1))
+    let quote = state.cfg_store.get().quote.clone();
+    Json(crate::session::build_catalog(&state.universe, &quote, 1))
+}
+
+/// The server's current (persisted) screening config — what every connection is
+/// screened with until the next `subscribe` overwrites it.
+pub async fn current_config(State(state): State<AppState>) -> impl IntoResponse {
+    Json((*state.cfg_store.get()).clone())
 }
 
 #[derive(serde::Deserialize)]
@@ -96,7 +103,8 @@ pub async fn spread_history(
 ) -> impl IntoResponse {
     let instrument = domain::Instrument::perp(&q.base, &q.quote);
     let window = q.window_ms.min(state.chart.max_window_ms);
-    let cfg = &state.default_cfg;
+    let cfg = state.cfg_store.get();
+    let cfg = &*cfg;
 
     let not_found = || {
         (
@@ -133,6 +141,116 @@ pub async fn spread_history(
             "points": points,
         })),
     )
+}
+
+#[derive(serde::Deserialize)]
+pub struct WhyQuery {
+    pub base: String,
+    #[serde(default = "default_quote")]
+    pub quote: String,
+}
+
+#[derive(Serialize)]
+struct WhyVenue {
+    exchange: ExchangeId,
+    bid: Option<Decimal>,
+    ask: Option<Decimal>,
+    age_ms: u64,
+    stale: bool,
+    valid: bool,
+    enabled_for_client: bool,
+    quote_volume_24h: Option<Decimal>,
+    funding_rate: Option<Decimal>,
+}
+
+/// `GET /why?base=LA` — the operator's "why is there no signal for this coin?"
+/// button. Runs the exact evaluation the screener runs, right now, and reports
+/// which stage stopped it: not screened at all, no usable pairing, or the
+/// specific filter that rejected the best pairing (with all the numbers).
+pub async fn why(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<WhyQuery>,
+) -> impl IntoResponse {
+    let instrument = domain::Instrument::perp(&q.base, &q.quote);
+    let cfg = state.cfg_store.get();
+    let listed_on: Vec<ExchangeId> = state
+        .universe
+        .catalog()
+        .into_iter()
+        .find(|(base, _)| *base == instrument.base)
+        .map(|(_, venues)| venues)
+        .unwrap_or_default();
+
+    // Stage 1: is the coin ingested at all? This is the answer to most "where
+    // is my signal?" questions — the coin never made it into the subscription
+    // set (not listed on enough venues, or outside the max_symbols cap).
+    if !state.market.instruments().contains(&instrument) {
+        let hint = if listed_on.len() < 2 {
+            "listed on fewer than 2 venues — a cross-exchange spread cannot exist"
+        } else {
+            "listed but not subscribed — outside ingest.max_symbols (raise it or add the coin to ingest.always_screen)"
+        };
+        return Json(serde_json::json!({
+            "instrument": instrument,
+            "screened": false,
+            "listed_on": listed_on,
+            "hint": hint,
+        }));
+    }
+
+    // Stage 2: per-venue quotes as the screener sees them right now.
+    let now = Instant::now();
+    let snap = state.market.snapshot(&instrument, now);
+    let venues: Vec<WhyVenue> = snap
+        .quotes
+        .iter()
+        .map(|v| WhyVenue {
+            exchange: v.exchange,
+            bid: v.book.best_bid().map(|l| l.price),
+            ask: v.book.best_ask().map(|l| l.price),
+            age_ms: now.saturating_duration_since(v.book.recv_ts).as_millis() as u64,
+            stale: v.stale,
+            valid: v.valid,
+            enabled_for_client: cfg.includes(v.exchange),
+            quote_volume_24h: v.quote_volume_24h,
+            funding_rate: v.funding.as_ref().map(|f| f.rate),
+        })
+        .collect();
+
+    // Stage 3: the actual evaluation, same code path as the alert engine
+    // (minus hysteresis/cooldown, which only dedup — they never create or
+    // destroy an opportunity).
+    match screener::evaluate(&snap, &cfg, state.oracle.as_ref()) {
+        Some(eval) => Json(serde_json::json!({
+            "instrument": instrument,
+            "screened": true,
+            "listed_on": listed_on,
+            "reason": eval.reason,
+            "spread": eval.spread,
+            "quality_score": eval.quality_score,
+            "dynamics": eval.stats,
+            "funding": eval.funding,
+            "venues": venues,
+        })),
+        None => {
+            let usable = snap.usable().filter(|v| cfg.includes(v.exchange)).count();
+            let hint = if !cfg.allows_symbol(&instrument.base) {
+                "symbol is excluded by the client's allow/deny lists"
+            } else if usable < 2 {
+                "fewer than 2 usable venues right now (stale/invalid books or venues disabled in the client config)"
+            } else {
+                "no evaluable pairing (books empty at the target size)"
+            };
+            Json(serde_json::json!({
+                "instrument": instrument,
+                "screened": true,
+                "listed_on": listed_on,
+                "reason": null,
+                "hint": hint,
+                "venues": venues,
+            }))
+        }
+    }
 }
 
 /// Validate a client-supplied config without subscribing.

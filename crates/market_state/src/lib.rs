@@ -22,8 +22,21 @@ pub struct MarketState {
     books: DashMap<(ExchangeId, Instrument), TopBook>,
     funding: DashMap<(ExchangeId, Instrument), FundingInfo>,
     tickers: DashMap<(ExchangeId, Instrument), TickerEntry>,
+    /// Last time *any* update arrived from each exchange — connection liveness.
+    last_msg: DashMap<ExchangeId, Instant>,
     history: SpreadHistory,
     staleness: Duration,
+    /// Absolute freshness cap for a book on a **live** connection.
+    ///
+    /// Venues with event-driven feeds (Gate, Bybit, MEXC deltas) send nothing
+    /// while a book doesn't change, which is normal for the thin coins this
+    /// screener targets. `recv_ts` therefore measures the last *message*, not
+    /// the last *change* — an old book on a live connection is still current.
+    /// Judging such books by `staleness` alone systematically excluded exactly
+    /// the quiet markets we care about. This cap bounds how long "unchanged"
+    /// is still believed (frozen/delisted symbols on a live connection must
+    /// eventually go stale).
+    quiet_book_max: Duration,
 }
 
 impl MarketState {
@@ -32,12 +45,22 @@ impl MarketState {
     }
 
     pub fn with_dynamics(staleness: Duration, dynamics: DynamicsConfig) -> Self {
+        Self::with_params(staleness, staleness * 10, dynamics)
+    }
+
+    pub fn with_params(
+        staleness: Duration,
+        quiet_book_max: Duration,
+        dynamics: DynamicsConfig,
+    ) -> Self {
         MarketState {
             books: DashMap::new(),
             funding: DashMap::new(),
             tickers: DashMap::new(),
+            last_msg: DashMap::new(),
             history: SpreadHistory::new(dynamics),
             staleness,
+            quiet_book_max: quiet_book_max.max(staleness),
         }
     }
 
@@ -54,6 +77,14 @@ impl MarketState {
     /// Apply one update. Returns the instrument that changed (for a book update)
     /// so the caller can trigger a screener recompute for just that instrument.
     pub fn apply(&self, update: MarketUpdate) -> Option<Instrument> {
+        self.apply_at(update, Instant::now())
+    }
+
+    /// [`apply`](Self::apply) with an explicit clock, for deterministic tests.
+    pub fn apply_at(&self, update: MarketUpdate, now: Instant) -> Option<Instrument> {
+        // Any inbound message proves the exchange connection is alive, which is
+        // what lets old-but-unchanged books stay usable below.
+        self.last_msg.insert(update.exchange(), now);
         match update {
             MarketUpdate::Book {
                 exchange,
@@ -105,7 +136,26 @@ impl MarketState {
             }
             let book = entry.value();
             let age = now.saturating_duration_since(book.recv_ts);
-            let stale = age > self.staleness;
+            // A book on a live connection is current until the venue says
+            // otherwise — event-driven feeds send nothing while nothing
+            // changes. Only a silent connection makes age alone disqualifying.
+            let alive = self
+                .last_msg
+                .get(ex)
+                .map(|t| now.saturating_duration_since(*t) <= self.staleness)
+                .unwrap_or(false);
+            let stale = if alive {
+                age > self.quiet_book_max
+            } else {
+                age > self.staleness
+            };
+            // Observation age for leg-skew: an unchanged book on a live
+            // connection is "as of now"; otherwise it is as old as its receipt.
+            let as_of_age_ms = if alive && !stale {
+                0
+            } else {
+                age.as_millis() as u64
+            };
             let valid = book.is_valid();
             let funding = self
                 .funding
@@ -122,6 +172,7 @@ impl MarketState {
                 funding,
                 quote_volume_24h,
                 open_interest,
+                as_of_age_ms,
                 stale,
                 valid,
             });
@@ -144,5 +195,86 @@ impl MarketState {
             .iter()
             .filter(|e| &e.key().1 == instrument)
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::BookLevel;
+    use rust_decimal_macros::dec;
+
+    fn book_at(recv_ts: Instant) -> TopBook {
+        TopBook {
+            bids: vec![BookLevel::new(dec!(100), dec!(1))],
+            asks: vec![BookLevel::new(dec!(101), dec!(1))],
+            recv_ts,
+            exch_ts: None,
+        }
+    }
+
+    fn apply_book(state: &MarketState, ex: ExchangeId, inst: &Instrument, at: Instant) {
+        state.apply_at(
+            MarketUpdate::Book {
+                exchange: ex,
+                instrument: inst.clone(),
+                book: book_at(at),
+            },
+            at,
+        );
+    }
+
+    /// The core liveness semantics: an old book stays usable while its
+    /// exchange keeps talking (quiet coin on an event-driven feed), goes stale
+    /// once the connection falls silent, and is capped by `quiet_book_max`
+    /// even on a live connection.
+    #[test]
+    fn quiet_book_freshness_follows_connection_liveness() {
+        let inst = Instrument::perp("XYZ", "USDT");
+        let staleness = Duration::from_secs(3);
+        let state = MarketState::with_params(
+            staleness,
+            Duration::from_secs(30),
+            DynamicsConfig::default(),
+        );
+        let t0 = Instant::now();
+        apply_book(&state, ExchangeId::Gate, &inst, t0);
+
+        // 10s later the book hasn't changed, but the connection is alive
+        // (a heartbeat/other-symbol update arrived 1s ago).
+        let t1 = t0 + Duration::from_secs(10);
+        state.apply_at(
+            MarketUpdate::Ticker {
+                exchange: ExchangeId::Gate,
+                instrument: Instrument::perp("OTHER", "USDT"),
+                quote_volume_24h: None,
+                open_interest: None,
+            },
+            t1 - Duration::from_secs(1),
+        );
+        let q = &state.snapshot(&inst, t1).quotes[0];
+        assert!(!q.stale, "unchanged book on a live connection is current");
+        assert_eq!(q.as_of_age_ms, 0, "and counts as observed now");
+
+        // Connection silent for longer than staleness → the book's own age rules.
+        let t2 = t1 + Duration::from_secs(5); // last_msg now 6s ago, book 15s old
+        let q = &state.snapshot(&inst, t2).quotes[0];
+        assert!(q.stale, "silent connection: book age exceeds staleness");
+        assert!(q.as_of_age_ms >= 15_000);
+
+        // Live connection but book older than quiet_book_max → stale anyway
+        // (frozen/delisted symbol guard).
+        let t3 = t0 + Duration::from_secs(40);
+        state.apply_at(
+            MarketUpdate::Ticker {
+                exchange: ExchangeId::Gate,
+                instrument: Instrument::perp("OTHER", "USDT"),
+                quote_volume_24h: None,
+                open_interest: None,
+            },
+            t3,
+        );
+        let q = &state.snapshot(&inst, t3).quotes[0];
+        assert!(q.stale, "quiet_book_max caps live-connection freshness");
     }
 }

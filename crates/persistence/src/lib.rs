@@ -1,6 +1,11 @@
 //! Optional CSV sink for emitted signals — feeds the lifetime/analysis question
 //! from spec §8.5 ("does a self-hosted SaaS actually have time to execute?").
 //! Disabled unless a path is configured.
+//!
+//! Also home to [`ConfigStore`]: the persisted client screening config.
+
+mod config_store;
+pub use config_store::ConfigStore;
 
 use screener::ScreenerEvent;
 use std::fs::{File, OpenOptions};

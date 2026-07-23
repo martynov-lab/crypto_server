@@ -40,6 +40,22 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Resolve the config for a `subscribe`.
+///
+/// A client-supplied config **overwrites the persisted server config** — Phase 1
+/// has one client, and its settings are the server's settings from that moment
+/// on (sampler, terminal logger, REST all follow). Subscribing without a config
+/// adopts whatever is currently stored.
+fn adopt_config(
+    state: &AppState,
+    config: Option<ClientConfig>,
+) -> Result<ClientConfig, String> {
+    match config {
+        Some(cfg) => state.cfg_store.set(cfg).map(|arc| (*arc).clone()),
+        None => Ok((*state.cfg_store.get()).clone()),
+    }
+}
+
 /// Await-send (used for handshake-critical messages). Returns false if the
 /// writer is gone.
 async fn emit(tx: &mpsc::Sender<Outbound>, out: Outbound) -> bool {
@@ -72,6 +88,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
+    // First message on every connection: the server's current (persisted)
+    // config, so the client knows what the server screens with before deciding
+    // whether to subscribe with its own settings or adopt these.
+    if !emit(
+        &out_tx,
+        Outbound::Server(ServerMessage::Config {
+            config: Box::new((*state.cfg_store.get()).clone()),
+        }),
+    )
+    .await
+    {
+        writer.abort();
+        return;
+    }
+
     // --- Handshake: wait for the first Subscribe. ---
     let cfg = loop {
         match ws_rx.next().await {
@@ -85,13 +116,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         writer.abort();
                         return;
                     }
-                    let cfg = config.unwrap_or_else(|| (*state.default_cfg).clone());
-                    if let Err(e) = cfg.validate() {
-                        let _ = emit(&out_tx, Outbound::Server(ServerMessage::Error { message: e })).await;
-                        writer.abort();
-                        return;
+                    match adopt_config(&state, config) {
+                        Ok(cfg) => break cfg,
+                        Err(e) => {
+                            let _ = emit(&out_tx, Outbound::Server(ServerMessage::Error { message: e })).await;
+                            writer.abort();
+                            return;
+                        }
                     }
-                    break cfg;
                 }
                 Ok(ClientMessage::Ping) => {
                     if !emit(&out_tx, Outbound::Server(ServerMessage::Pong)).await {
@@ -138,11 +170,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     let _ = emit(&out_tx, Outbound::Server(ServerMessage::Error { message: "unauthorized".into() })).await;
                                     break 'main;
                                 }
-                                let newcfg = config.unwrap_or_else(|| (*state.default_cfg).clone());
-                                if let Err(e) = newcfg.validate() {
-                                    let _ = emit(&out_tx, Outbound::Server(ServerMessage::Error { message: e })).await;
-                                    continue;
-                                }
+                                let newcfg = match adopt_config(&state, config) {
+                                    Ok(cfg) => cfg,
+                                    Err(e) => {
+                                        let _ = emit(&out_tx, Outbound::Server(ServerMessage::Error { message: e })).await;
+                                        continue;
+                                    }
+                                };
                                 debug!("client reconfigured (watches preserved)");
                                 engine = ScreenerEngine::new(newcfg.clone());
                                 let _ = emit(&out_tx, Outbound::Server(ServerMessage::Subscribed { config: Box::new(newcfg) })).await;

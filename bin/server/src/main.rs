@@ -37,7 +37,7 @@ fn build_symbol_map(
     // base -> venues that list it.
     let listed: HashMap<String, Vec<ExchangeId>> = universe.catalog().into_iter().collect();
 
-    let bases: Vec<String> = if settings.ingest.auto_discover && !universe.is_empty() {
+    let mut bases: Vec<String> = if settings.ingest.auto_discover && !universe.is_empty() {
         let mut b = discovered_bases(settings, enabled, universe);
         b.truncate(settings.ingest.max_symbols);
         b
@@ -49,6 +49,15 @@ fn build_symbol_map(
             .map(|s| s.to_uppercase())
             .collect()
     };
+    // Force-include operator-pinned coins, unaffected by discovery ranking or
+    // the max_symbols cap — "why is coin X not screened" must have an answer
+    // that doesn't involve raising the cap for everything.
+    for pinned in &settings.ingest.always_screen {
+        let p = pinned.to_uppercase();
+        if !bases.contains(&p) {
+            bases.push(p);
+        }
+    }
 
     let mut map: HashMap<ExchangeId, Vec<Instrument>> =
         enabled.iter().map(|&e| (e, Vec::new())).collect();
@@ -126,8 +135,9 @@ async fn main() -> anyhow::Result<()> {
         min_sample_interval: Duration::from_millis(500),
         reference_threshold: settings.default_client.min_net_spread_pct,
     };
-    let market = Arc::new(MarketState::with_dynamics(
+    let market = Arc::new(MarketState::with_params(
         Duration::from_millis(settings.ingest.staleness_ms),
+        Duration::from_millis(settings.ingest.quiet_book_max_ms),
         dynamics_cfg,
     ));
     let tape = Arc::new(spread_tape::SpreadTape::new(
@@ -195,7 +205,14 @@ async fn main() -> anyhow::Result<()> {
     let manager = IngestManager::new(connectors, symbols_by_exchange, IngestParams::default());
     let (mut rx, _conn_handles) = manager.spawn();
 
-    let default_cfg = Arc::new(settings.default_client.clone());
+    // The single source of truth for the screening config: the persisted client
+    // config when one exists, else the TOML `default_client` bootstrap. Every
+    // consumer (sampler, terminal logger, WS sessions, REST) reads it live, so
+    // a client's `subscribe` retunes the whole server.
+    let cfg_store = Arc::new(persistence::ConfigStore::load_or(
+        settings.server.client_config_path.clone().into(),
+        settings.default_client.clone(),
+    ));
 
     // Drain updates → market state → notify sessions.
     {
@@ -230,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let market = market.clone();
         let tape = tape.clone();
-        let default_cfg = default_cfg.clone();
+        let cfg_store = cfg_store.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         let resolution = Duration::from_millis(settings.chart.resolution_ms);
         let sanity_cap = settings.chart.sanity_max_spread_pct;
@@ -241,12 +258,13 @@ async fn main() -> anyhow::Result<()> {
                     _ = timer.tick() => {
                         let now = std::time::Instant::now();
                         let ts_ms = chrono::Utc::now().timestamp_millis();
+                        let cfg = cfg_store.get();
                         for instrument in market.instruments() {
                             let snap = market.snapshot(&instrument, now);
                             // Dynamics feed (best pair) with the sanity guard so a
                             // data-error spike can't pollute baseline/z-score.
                             if let Some(point) =
-                                screener::best_spread_point(&snap, &default_cfg, ts_ms)
+                                screener::best_spread_point(&snap, &cfg, ts_ms)
                             {
                                 if point.net_pct.abs() <= sanity_cap {
                                     market.record_spread(&instrument, point.net_pct, now);
@@ -257,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
                             // Chart tape: per-venue VWAP snapshot. Pair selection
                             // and In/Out/funding are derived per-watcher at delivery.
                             if let Some(sample) =
-                                screener::venue_sample(&snap, &default_cfg, ts_ms)
+                                screener::venue_sample(&snap, &cfg, ts_ms)
                             {
                                 tape.record(&instrument, sample);
                             }
@@ -281,15 +299,26 @@ async fn main() -> anyhow::Result<()> {
     if settings.server.log_signals {
         let market = market.clone();
         let oracle: Arc<dyn screener::TransferOracle> = store.clone();
-        let engine = screener::ScreenerEngine::new((*default_cfg).clone());
+        let cfg_store = cfg_store.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         let scan = Duration::from_millis(settings.chart.resolution_ms.max(500));
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(scan);
-            info!("terminal signal logger active (using default_client config)");
+            // The engine carries per-instrument hysteresis state, so it is
+            // rebuilt only when the client actually changes the config (tracked
+            // by the store's generation), not on every scan.
+            let (mut cfg_gen, cfg) = cfg_store.snapshot();
+            let mut engine = screener::ScreenerEngine::new((*cfg).clone());
+            info!("terminal signal logger active (using the current client config)");
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
+                        let (gen, cfg) = cfg_store.snapshot();
+                        if gen != cfg_gen {
+                            info!("client config changed; signal logger reconfigured");
+                            engine = screener::ScreenerEngine::new((*cfg).clone());
+                            cfg_gen = gen;
+                        }
                         let now = std::time::Instant::now();
                         let ts_ms = chrono::Utc::now().timestamp_millis();
                         for instrument in market.instruments() {
@@ -355,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
             sanity_max_spread_pct: settings.chart.sanity_max_spread_pct,
         },
         events: events_tx.clone(),
-        default_cfg: default_cfg.clone(),
+        cfg_store: cfg_store.clone(),
         auth: Arc::new(auth_policy()),
         metrics_render,
     };

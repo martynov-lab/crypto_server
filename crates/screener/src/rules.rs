@@ -9,7 +9,6 @@ use domain::transfer::has_common_transfer_route;
 use domain::{Decimal, ExchangeId, Spread, SpreadReason, TransferStatus};
 use market_state::{ExchangeQuote, InstrumentSnapshot, SpreadStats};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use std::time::Instant;
 
 /// Read-only source of transfer status, implemented by the `transfer_status`
 /// crate. Kept as a trait so the screener has no dependency cycle and tests can
@@ -220,12 +219,11 @@ fn funding_cost_pct(cfg: &ClientConfig, buy_q: &ExchangeQuote, sell_q: &Exchange
     long - short
 }
 
-/// How far apart in time the two legs' books were received.
+/// How far apart in time the two legs were effectively observed. Uses each
+/// quote's `as_of_age_ms` (0 = current), so two quiet-but-live books count as
+/// simultaneous, while a leg from a silent connection carries its real age.
 fn leg_skew_ms(buy_q: &ExchangeQuote, sell_q: &ExchangeQuote) -> u64 {
-    let (a, b) = (buy_q.book.recv_ts, sell_q.book.recv_ts);
-    let older: Instant = a.min(b);
-    let newer: Instant = a.max(b);
-    newer.saturating_duration_since(older).as_millis() as u64
+    buy_q.as_of_age_ms.abs_diff(sell_q.as_of_age_ms)
 }
 
 /// Mid price of a quote, used only for the cross-venue consensus check.
@@ -408,9 +406,16 @@ fn classify(
                 // Score *this* client's spread, not the shared history's last
                 // sample — fees differ per client, so the two are not the same
                 // number and filtering on the wrong one rejects good signals.
-                match st.z_for(es.net_pct) {
-                    Some(z) if z >= cfg.min_spike_z => {}
-                    _ => return SpreadReason::NotASpike,
+                let is_spike = matches!(st.z_for(es.net_pct), Some(z) if z >= cfg.min_spike_z);
+                // A strong round-trip edge stands on its own: a steady spread
+                // that is executable and profitable after the full round trip
+                // is a signal even without the spike shape. The shape still
+                // discounts `quality_score`.
+                let strong_edge = cfg
+                    .spike_bypass_round_trip_mult
+                    .map_or(false, |m| econ.round_trip_pct >= cfg.min_round_trip_pct * m);
+                if !is_spike && !strong_edge {
+                    return SpreadReason::NotASpike;
                 }
                 if st.episode_ms > cfg.max_spread_duration_ms {
                     return SpreadReason::TooPersistent;
@@ -640,7 +645,7 @@ mod tests {
     use domain::{BookLevel, Instrument, TopBook};
     use market_state::InstrumentSnapshot;
     use rust_decimal_macros::dec;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn book(bid: Decimal, ask: Decimal) -> TopBook {
         book_full(bid, ask, dec!(1000), Instant::now())
@@ -666,6 +671,7 @@ mod tests {
             funding: None,
             quote_volume_24h: vol,
             open_interest: None,
+            as_of_age_ms: 0,
             stale: false,
             valid: true,
         }
@@ -704,7 +710,7 @@ mod tests {
     }
 
     fn cfg() -> ClientConfig {
-        ClientConfig::default() // band 0.6%..25%, volume band 100k..200k
+        ClientConfig::default() // band 0.6%..25%, volume floor 100k, no ceiling
     }
 
     #[test]
@@ -739,13 +745,17 @@ mod tests {
 
     #[test]
     fn summary_row_respects_volume_band() {
+        let mut band = cfg();
+        band.max_24h_quote_volume = Some(dec!(200000)); // opt-in low-cap ceiling
         let mut snap = snapshot("XYZ", dec!(100), dec!(106));
         snap.quotes[0].quote_volume_24h = Some(dec!(900000)); // above 200k ceiling
-        assert!(summary_row(&snap, &cfg()).is_none());
-        snap.quotes[0].quote_volume_24h = Some(dec!(50000)); // below 100k floor
-        assert!(summary_row(&snap, &cfg()).is_none());
-        snap.quotes[0].quote_volume_24h = None; // unknown on both legs => skipped
+        assert!(summary_row(&snap, &band).is_none());
+        // Default config has no ceiling: the same volume passes.
         assert!(summary_row(&snap, &cfg()).is_some());
+        snap.quotes[0].quote_volume_24h = Some(dec!(50000)); // below 100k floor
+        assert!(summary_row(&snap, &band).is_none());
+        snap.quotes[0].quote_volume_24h = None; // unknown on both legs => skipped
+        assert!(summary_row(&snap, &band).is_some());
     }
 
     /// An entry spread that clears the band can still lose money once the
@@ -830,25 +840,35 @@ mod tests {
         assert!(ev.spread.expected_profit_quote > dec!(0));
     }
 
-    /// Two individually-fresh books observed seconds apart never coexisted.
+    /// Two legs effectively observed seconds apart never coexisted.
     #[test]
     fn legs_observed_far_apart_are_rejected() {
-        let now = Instant::now();
+        let mut old_leg = quote(ExchangeId::Bybit, dec!(99.9), dec!(100), Some(dec!(150000)));
+        // Its exchange connection is silent: the quote really is 2s old.
+        old_leg.as_of_age_ms = 2000;
         let snap = snapshot_of(vec![
-            from_book(
-                ExchangeId::Bybit,
-                book_full(dec!(99.9), dec!(100), dec!(1000), now - Duration::from_millis(2000)),
-                Some(dec!(150000)),
-            ),
-            from_book(
-                ExchangeId::Okx,
-                book_full(dec!(106), dec!(106.1), dec!(1000), now),
-                Some(dec!(150000)),
-            ),
+            old_leg,
+            quote(ExchangeId::Okx, dec!(106), dec!(106.1), Some(dec!(150000))),
         ]);
         let ev = evaluate(&snap, &eval_cfg(), &NoTransferInfo).unwrap();
         assert_eq!(ev.reason, SpreadReason::LegSkew);
         assert!(ev.spread.leg_skew_ms >= 2000);
+    }
+
+    /// A quiet book on a live connection is *current* (`as_of_age_ms = 0`), so
+    /// pairing it with a fresh venue must not be rejected as skew — that was
+    /// systematically excluding the thin coins the screener targets.
+    #[test]
+    fn quiet_but_live_leg_is_not_skew() {
+        // Both legs report as-of "now" even though one venue hasn't sent an
+        // update in seconds (market_state sets as_of_age_ms = 0 for it).
+        let snap = snapshot_of(vec![
+            quote(ExchangeId::Bybit, dec!(99.9), dec!(100), Some(dec!(150000))),
+            quote(ExchangeId::Okx, dec!(106), dec!(106.1), Some(dec!(150000))),
+        ]);
+        let ev = evaluate(&snap, &eval_cfg(), &NoTransferInfo).unwrap();
+        assert_eq!(ev.reason, SpreadReason::Signal);
+        assert_eq!(ev.spread.leg_skew_ms, 0);
     }
 
     /// A venue quoting a different token entirely must be dropped before
@@ -880,6 +900,51 @@ mod tests {
             quote(ExchangeId::Okx, dec!(122), dec!(122.1), Some(dec!(150000))),
         ]);
         assert_eq!(reason_of(&snap, &eval_cfg()), SpreadReason::Signal);
+    }
+
+    /// A steady spread with a strong round-trip edge is a signal even without
+    /// the spike shape; a weak edge still needs the spike.
+    #[test]
+    fn strong_round_trip_edge_bypasses_the_spike_requirement() {
+        use market_state::SpreadStats;
+        // A steady-but-tradable coin: entry gross 1.4% (net 1.28%), baseline
+        // 0.9% (under max_baseline_spread_pct), MAD 0.2%.
+        //   z = (0.0128 - 0.009) / 0.002 = 1.9  → not a spike (min is 3)
+        //   round trip = 0.0128 - 0.009 - 0.0012 = 0.0026
+        let mut snap = snapshot("XYZ", dec!(100), dec!(101.4));
+        snap.stats = Some(SpreadStats {
+            baseline_pct: dec!(0.009),
+            mad_pct: dec!(0.002),
+            stddev_pct: dec!(0.002),
+            current_pct: dec!(0.0128),
+            z_score: Some(dec!(1.9)),
+            sample_count: 100,
+            baseline_samples: 100,
+            episode_ms: 0,
+        });
+
+        // Bypass bar = 2 × 0.001 = 0.002 ≤ 0.0026 → passes without a spike.
+        assert_eq!(
+            evaluate(&snap, &eval_cfg(), &NoTransferInfo).unwrap().reason,
+            SpreadReason::Signal,
+            "steady but strongly profitable spread must pass"
+        );
+
+        // Bypass disabled → the spike requirement is hard again.
+        let mut hard = eval_cfg();
+        hard.spike_bypass_round_trip_mult = None;
+        assert_eq!(
+            evaluate(&snap, &hard, &NoTransferInfo).unwrap().reason,
+            SpreadReason::NotASpike
+        );
+
+        // Bar raised above the edge (10 × 0.001 = 1% > 0.26%) → still gated.
+        let mut strict = eval_cfg();
+        strict.spike_bypass_round_trip_mult = Some(dec!(10));
+        assert_eq!(
+            evaluate(&snap, &strict, &NoTransferInfo).unwrap().reason,
+            SpreadReason::NotASpike
+        );
     }
 
     /// The volume floor guards fillability, so it belongs on the *thinner* leg

@@ -59,6 +59,7 @@ dependencies = [
  "domain",
  "futures-util",
  "market_state",
+ "persistence",
  "screener",
  "serde",
  "serde_json",
@@ -1098,7 +1099,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "domain",
+ "rust_decimal",
+ "rust_decimal_macros",
  "screener",
+ "serde_json",
  "tokio",
  "tracing",
 ]

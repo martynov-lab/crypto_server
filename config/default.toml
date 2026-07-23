@@ -5,6 +5,10 @@
 [server]
 # axum bind address for both REST and the WS hub.
 bind = "127.0.0.1:8080"
+# Where the client's screening config is persisted. A client `subscribe` with a
+# config overwrites this file and the whole server screens with it from then on;
+# [default_client] below only bootstraps a fresh install.
+client_config_path = "data/client_config.json"
 
 [ingest]
 # Which exchanges to connect. Must be a subset of the 8 supported ids.
@@ -12,8 +16,12 @@ exchanges = ["bybit", "okx", "mexc", "bitget", "gate", "coinex", "kucoin", "phem
 quote = "USDT"
 # Book depth levels to request/keep per instrument (spec §13: start 10–25).
 depth_levels = 20
-# A book older than this (by local monotonic recv time) is excluded from spreads.
+# A book older than this (by local monotonic recv time) is excluded from
+# spreads — but only when its exchange connection has gone silent. On a live
+# connection an unchanged book is current (event-driven feeds send nothing
+# while nothing trades), up to quiet_book_max_ms.
 staleness_ms = 3000
+quiet_book_max_ms = 30000
 
 # --- Universe auto-discovery ---
 # When true, poll each exchange's public contracts endpoint and screen every base
@@ -26,7 +34,10 @@ auto_discover = true
 # out to screen every base listed on >= min_venues exchanges instead.
 anchor_exchange = "bybit"
 min_venues = 2
-max_symbols = 150
+max_symbols = 400
+# Coins to screen unconditionally, on top of discovery ranking and the
+# max_symbols cap — the answer to "why is there no signal for coin X".
+always_screen = []
 discovery_interval_secs = 900
 # Fallback / seed list used when auto_discover = false (or discovery fails).
 symbols = ["BTC", "ETH", "SOL", "ARB", "OP", "SUI", "APT", "TIA", "SEI", "WLD"]
@@ -69,11 +80,11 @@ deny_symbols = []
 # futures/futures arb we run today; spot legs are accepted for forward
 # compatibility (spot/spot, spot/perp, perp/spot) once spot ingestion lands.
 market_pairs = [{ buy = "perp", sell = "perp" }]
-# 24h quote-volume band (USDT): screen only coins whose reported volume falls
-# inside it. The low-cap 100k..200k band targets thin coins where spreads
-# persist; the client may widen or remove the ceiling.
+# 24h quote-volume floor (USDT). The ceiling is off by default — set
+# max_24h_quote_volume (e.g. "200000") to hunt only low-cap coins where spreads
+# persist; leaving it unset screens everything above the floor.
 min_24h_quote_volume = "100000"
-max_24h_quote_volume = "200000"
+# max_24h_quote_volume = "200000"
 min_open_interest = "0"      # base units; 0 => disabled
 
 # Entry-spread band — the 0.6%..25% control. Spreads outside the band are not
@@ -117,7 +128,10 @@ max_price_deviation_pct = "0.10"
 # Spread dynamics — the "tight baseline, brief spike" signature of a good arb coin.
 enable_dynamics = true
 max_baseline_spread_pct = "0.01"  # reject coins whose median spread is persistently wide
-min_spike_z = "3"                 # current spread must be >=3 stddevs above its own mean
+min_spike_z = "3"                 # current spread must be >=3 robust deviations above baseline
+# Soft override: a round-trip edge >= min_round_trip_pct x this passes even
+# without a spike (a steady, executable, profitable spread is a signal too).
+spike_bypass_round_trip_mult = "2"
 max_spread_duration_ms = 300000   # reject spreads that stay wide > 5 min (trap)
 min_dynamics_samples = 20         # warmup before dynamics filters apply
 max_chart_spread_pct = "0.50"     # client-side chart anomaly cutoff (drops |net| above this from the watch stream)

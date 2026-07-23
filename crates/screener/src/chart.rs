@@ -136,6 +136,7 @@ mod tests {
             funding: None,
             quote_volume_24h: None,
             open_interest: None,
+            as_of_age_ms: 0,
             stale: false,
             valid: true,
         }

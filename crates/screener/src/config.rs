@@ -50,9 +50,9 @@ pub struct ClientConfig {
     /// Drop markets below this 24h quote volume (USDT). Together with
     /// `max_24h_quote_volume` this forms the volume band the client screens.
     pub min_24h_quote_volume: Decimal,
-    /// Drop markets above this 24h quote volume (USDT); `None` = no ceiling.
-    /// A low-cap band (e.g. 100k..200k) targets thin coins where spreads
-    /// actually persist, instead of hyper-liquid majors.
+    /// Drop markets above this 24h quote volume (USDT); `None` = no ceiling
+    /// (the default). Set a low-cap band (e.g. 100k..200k) to target thin coins
+    /// where spreads persist, instead of hyper-liquid majors.
     pub max_24h_quote_volume: Option<Decimal>,
     /// Optional perp open-interest floor (base units).
     pub min_open_interest: Option<Decimal>,
@@ -108,9 +108,15 @@ pub struct ClientConfig {
     /// Reject coins whose *baseline* (median) spread is above this — a
     /// persistently wide spread is a structural break, not an opportunity.
     pub max_baseline_spread_pct: Decimal,
-    /// Require the current spread to be at least this many stddevs above its
-    /// own mean (a genuine spike, not "it's always wide").
+    /// Require the current spread to be at least this many robust deviations
+    /// above its own baseline (a genuine spike, not "it's always wide").
     pub min_spike_z: Decimal,
+    /// Soft override for the spike requirement: a pairing whose round-trip
+    /// edge is at least `min_round_trip_pct × this` passes even without a
+    /// spike. A steady, executable, profitable spread is a signal too — the
+    /// spike shape then only affects `quality_score`. `None` = spike is a hard
+    /// requirement.
+    pub spike_bypass_round_trip_mult: Option<Decimal>,
     /// Reject a spread that has stayed above threshold longer than this — a
     /// healthy arb closes fast; a long-lived wide gap is a trap.
     pub max_spread_duration_ms: u64,
@@ -145,7 +151,7 @@ impl Default for ClientConfig {
             deny_symbols: vec![],
             market_pairs: vec![MarketPair::PERP_PERP],
             min_24h_quote_volume: dec_lit("100000"),
-            max_24h_quote_volume: Some(dec_lit("200000")),
+            max_24h_quote_volume: None,
             min_open_interest: None,
             min_net_spread_pct: dec_lit("0.006"),
             max_net_spread_pct: dec_lit("0.25"),
@@ -169,6 +175,7 @@ impl Default for ClientConfig {
             enable_dynamics: true,
             max_baseline_spread_pct: dec_lit("0.01"),
             min_spike_z: dec_lit("3"),
+            spike_bypass_round_trip_mult: Some(dec_lit("2")),
             max_spread_duration_ms: 300_000,
             min_dynamics_samples: 20,
             max_chart_spread_pct: dec_lit("0.50"),

@@ -14,6 +14,9 @@ pub struct ExchangeQuote {
     pub quote_volume_24h: Option<Decimal>,
     /// Open interest (base units) reported by this venue, if any.
     pub open_interest: Option<Decimal>,
+    /// Effective observation age (ms) for leg-skew: `0` when the book is
+    /// current (unchanged on a live connection), else its receipt age.
+    pub as_of_age_ms: u64,
     pub stale: bool,
     pub valid: bool,
 }

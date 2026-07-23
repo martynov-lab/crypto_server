@@ -31,6 +31,8 @@ endpoints. Everything here is derived from the running server
 | Current best spread per instrument | GET | `/summary` |
 | Traded-instrument catalog (coins × venues) | GET | `/instruments` |
 | Spread chart history (fallback) | GET | `/spread/history?base=…&quote=…&window_ms=…` |
+| Current (persisted) screening config | GET | `/config` |
+| Why is there no signal for a coin | GET | `/why?base=…&quote=…` |
 | Validate a config without subscribing | POST | `/config/validate` |
 
 Local default host: `127.0.0.1:8080` (see `config/default.toml`).
@@ -39,8 +41,26 @@ Local default host: `127.0.0.1:8080` (see `config/default.toml`).
 
 ### 2.1 Handshake
 
-On connect the client sends exactly one `subscribe` message. `token` and
-`config` are both optional; omit `config` to use the server defaults.
+The server speaks first: immediately on connect it pushes its **current
+(persisted) screening config**, so the client always knows what the server is
+screening with before deciding whether to keep it or send its own:
+
+```json
+{ "type": "config", "config": { "exchanges": ["bybit","okx", ...], "quote": "USDT", ... } }
+```
+
+The client then sends one `subscribe`. `token` and `config` are both optional.
+
+- `config` **present** → it becomes the server's config: validated, **persisted
+  to disk, and adopted by the whole server** (sampler, terminal logger, REST
+  `/summary`, future connections). Phase 1 has a single client, so its settings
+  are the server's settings; per-user configs arrive with auth in a later phase.
+- `config` **omitted** → the session adopts the stored config from the `config`
+  message above.
+
+Note: a supplied config replaces the stored one **wholesale**; omitted fields
+fall back to compiled defaults, not to previously stored values. Send the full
+config (start from the one received in `config`).
 
 Client → server:
 
@@ -297,7 +317,7 @@ should render the newest event per instrument and not assume every tick arrives.
 | `deny_symbols` | string[] | `[]` | Base-asset deny list |
 | `market_pairs` | `{buy,sell}`[] of `"spot"\|"perp"` | `[{"buy":"perp","sell":"perp"}]` | Market-kind combos to screen (perp/perp live; spot legs forward-compat) |
 | `min_24h_quote_volume` | decimal-str | `"100000"` | 24h volume floor (USDT) |
-| `max_24h_quote_volume` | decimal-str? | `"200000"` | 24h volume ceiling (USDT); `null` = off |
+| `max_24h_quote_volume` | decimal-str? | `null` | 24h volume ceiling (USDT); `null` = off. Set (e.g. `"200000"`) to hunt only low-caps |
 | `min_open_interest` | decimal-str? | `null` | OI floor (not yet enforced) |
 | `min_net_spread_pct` | decimal-str | `"0.006"` | Lower band = 0.6% |
 | `max_net_spread_pct` | decimal-str | `"0.25"` | Upper band = 25% (ghost cap) |
@@ -317,7 +337,8 @@ should render the newest event per instrument and not assume every tick arrives.
 | `max_price_deviation_pct` | decimal-str? | `"0.10"` | Drop a venue whose mid is this far from the cross-venue median (needs ≥3 venues); `null` = off |
 | `enable_dynamics` | bool | `true` | Master switch for the spread-dynamics filters |
 | `max_baseline_spread_pct` | decimal-str | `"0.01"` | Reject persistently-wide coins (baseline above this) |
-| `min_spike_z` | decimal-str | `"3"` | Require current spread ≥ this many stddevs above its mean |
+| `min_spike_z` | decimal-str | `"3"` | Require current spread ≥ this many robust deviations above its baseline |
+| `spike_bypass_round_trip_mult` | decimal-str? | `"2"` | Round-trip edge ≥ `min_round_trip_pct × this` passes without a spike; `null` = spike is a hard requirement |
 | `max_spread_duration_ms` | int | `300000` | Reject spreads that stay wide longer than this |
 | `min_dynamics_samples` | int | `20` | Warmup before dynamics filters apply |
 | `max_chart_spread_pct` | decimal-str | `"0.50"` | Chart anomaly cutoff: watch backfill/ticks whose abs(net_pct) exceeds this are dropped for this client (wrong-token / stale-quote data errors) |

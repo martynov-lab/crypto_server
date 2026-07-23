@@ -71,6 +71,11 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// The server's current (persisted) screening config, pushed as the very
+    /// first message on every connection — before any `subscribe` — so the
+    /// client always knows what the server is screening with. Sent again is
+    /// never needed: `subscribed` echoes the config after every change.
+    Config { config: Box<ClientConfig> },
     /// Acknowledges a successful subscribe, echoing the effective config.
     Subscribed { config: Box<ClientConfig> },
     /// The traded-instrument catalog (which coins trade on which venues), sent

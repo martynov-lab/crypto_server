@@ -10,7 +10,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use domain::Instrument;
 use market_state::MarketState;
-use screener::{ClientConfig, TransferOracle};
+use persistence::ConfigStore;
+use screener::TransferOracle;
 use spread_tape::SpreadTape;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -38,7 +39,9 @@ pub struct AppState {
     /// Fan-out of "this instrument's market state changed" notifications. WS
     /// sessions subscribe; lag is tolerated (natural coalescing).
     pub events: broadcast::Sender<Instrument>,
-    pub default_cfg: Arc<ClientConfig>,
+    /// The persisted client config — the single config the whole server screens
+    /// with. A client's `subscribe` overwrites it; sessions and REST read it.
+    pub cfg_store: Arc<ConfigStore>,
     pub auth: Arc<AuthPolicy>,
     /// Renders the current Prometheus metrics text (injected by the binary so
     /// this crate needn't depend on a specific exporter).
@@ -53,6 +56,8 @@ pub fn router(state: AppState) -> Router {
         .route("/summary", get(rest::summary))
         .route("/instruments", get(rest::instruments))
         .route("/spread/history", get(rest::spread_history))
+        .route("/why", get(rest::why))
+        .route("/config", get(rest::current_config))
         .route("/config/validate", post(rest::validate_config))
         .route("/ws", get(ws::ws_handler))
         .with_state(state)
