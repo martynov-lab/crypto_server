@@ -144,6 +144,57 @@ pub async fn spread_history(
 }
 
 #[derive(serde::Deserialize)]
+pub struct RangeQuery {
+    pub base: String,
+    #[serde(default = "default_quote")]
+    pub quote: String,
+    /// Defaults to the client config's `history_window_ms` (up to 3 days).
+    #[serde(default)]
+    pub window_ms: Option<u64>,
+}
+
+/// `GET /spread/range?base=…&window_ms=…` — the long spread history: coarse
+/// best-pair aggregates (min/max/close net spread per bucket, default 1 minute)
+/// retained for days, so the client can see what spread a coin is even capable
+/// of. Distinct from `/spread/history`, which serves the fine per-venue tape
+/// for the live chart but only holds minutes.
+pub async fn spread_range(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<RangeQuery>,
+) -> impl IntoResponse {
+    let instrument = domain::Instrument::perp(&q.base, &q.quote);
+    let cfg = state.cfg_store.get();
+    // Effective window: requested → client cap → server retention.
+    let window = q
+        .window_ms
+        .unwrap_or(cfg.history_window_ms)
+        .min(cfg.history_window_ms)
+        .min(state.tape.history_window_ms());
+
+    match state.tape.long_history(&instrument, window) {
+        Some(buckets) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "instrument": instrument,
+                "resolution_ms": state.tape.history_resolution_ms(),
+                "window_ms": window,
+                "buckets": buckets,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!(
+                    "no spread history for {}/{} (accumulates from server start)",
+                    q.base.to_uppercase(),
+                    q.quote.to_uppercase()
+                )
+            })),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
 pub struct WhyQuery {
     pub base: String,
     #[serde(default = "default_quote")]

@@ -56,6 +56,7 @@ pub fn router(state: AppState) -> Router {
         .route("/summary", get(rest::summary))
         .route("/instruments", get(rest::instruments))
         .route("/spread/history", get(rest::spread_history))
+        .route("/spread/range", get(rest::spread_range))
         .route("/why", get(rest::why))
         .route("/config", get(rest::current_config))
         .route("/config/validate", post(rest::validate_config))

@@ -26,9 +26,23 @@ pub use rules::{
     TransferOracle,
 };
 
+/// Importance of a pushed signal — mirrors the two-threshold notification
+/// model: `info` at the first crossing (show in the list, don't notify),
+/// `alert` once the spread reaches `alert_net_spread_pct` (notify).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalLevel {
+    /// Crossed `min_net_spread_pct`: display-only.
+    Info,
+    /// Reached `alert_net_spread_pct`: the notification-worthy signal.
+    Alert,
+}
+
 /// A signal pushed to a client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenerEvent {
+    /// `info` = list it; `alert` = notify on it.
+    pub level: SignalLevel,
     pub spread: Spread,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub funding: Option<FundingSignal>,
@@ -72,6 +86,9 @@ struct InstrState {
     /// When the current above-threshold episode began (for lifetime + persistence).
     opened_at: Option<Instant>,
     last_emit: Option<Instant>,
+    /// Highest level emitted during the current episode, for the info→alert
+    /// upgrade push. Reset when the episode closes.
+    last_level: Option<SignalLevel>,
     /// Consecutive non-signal evaluations, for debounced episode close.
     reject_streak: u32,
 }
@@ -143,6 +160,7 @@ impl ScreenerEngine {
                     );
                 }
                 st.peak = PeakState::default();
+                st.last_level = None;
             }
             return None;
         }
@@ -153,6 +171,19 @@ impl ScreenerEngine {
             st.opened_at = Some(now);
         }
         let opened = st.opened_at.unwrap_or(now);
+
+        // Signal level: `info` above the entry floor, `alert` once the spread
+        // reaches the client's notification threshold. The first time an open
+        // episode reaches `alert` after emitting only `info`, that upgrade is
+        // pushed immediately — it bypasses the hysteresis step and the cooldown
+        // (a "now it's worth acting" moment must not wait for +0.5%), but still
+        // respects the lifetime gate and the global rate cap.
+        let level = if eval.spread.net_pct >= self.cfg.alert_net_spread_pct {
+            SignalLevel::Alert
+        } else {
+            SignalLevel::Info
+        };
+        let upgrade = level == SignalLevel::Alert && st.last_level == Some(SignalLevel::Info);
 
         // Every non-mutating gate runs *before* hysteresis. `PeakState::decide`
         // raises the peak as a side effect, so calling it first would let a
@@ -165,9 +196,12 @@ impl ScreenerEngine {
         {
             return None;
         }
-        if let Some(last) = st.last_emit {
-            if now.saturating_duration_since(last) < Duration::from_millis(self.cfg.cooldown_ms) {
-                return None;
+        if !upgrade {
+            if let Some(last) = st.last_emit {
+                if now.saturating_duration_since(last) < Duration::from_millis(self.cfg.cooldown_ms)
+                {
+                    return None;
+                }
             }
         }
 
@@ -177,7 +211,7 @@ impl ScreenerEngine {
             self.cfg.min_net_spread_pct,
             self.cfg.hysteresis_step_pct,
         );
-        if decision != Decision::Emit {
+        if decision != Decision::Emit && !upgrade {
             return None;
         }
 
@@ -189,7 +223,15 @@ impl ScreenerEngine {
         }
 
         st.last_emit = Some(now);
+        st.last_level = Some(match st.last_level {
+            // Never downgrade the episode's recorded level: once alerted, a
+            // dip back under the alert threshold must not re-arm the upgrade
+            // push (that would re-notify on every oscillation around it).
+            Some(SignalLevel::Alert) => SignalLevel::Alert,
+            _ => level,
+        });
         Some(ScreenerEvent {
+            level,
             spread: eval.spread,
             funding: eval.funding,
             dynamics: eval.stats,
@@ -340,6 +382,55 @@ mod tests {
             engine.on_instrument(&snap_b, &NoTransferInfo, t1, 3).is_some(),
             "rate cap must defer the signal, not destroy it"
         );
+    }
+
+    /// The two-threshold notification model: first crossing is `info`
+    /// (display-only), reaching `alert_net_spread_pct` upgrades to `alert`
+    /// immediately — past cooldown and the hysteresis step.
+    #[test]
+    fn info_upgrades_to_alert_immediately() {
+        let mut c = cfg_no_transfer();
+        c.min_net_spread_pct = dec!(0.006);
+        c.alert_net_spread_pct = dec!(0.01);
+        c.cooldown_ms = 60_000; // upgrade must not wait this out
+        let engine = ScreenerEngine::new(c);
+        let t = Instant::now();
+
+        // 0.8% gross → ~0.68% net: info.
+        let e1 = engine
+            .on_instrument(&snapshot(dec!(100), dec!(100.8)), &NoTransferInfo, t, 1)
+            .expect("first crossing emits");
+        assert_eq!(e1.level, SignalLevel::Info);
+
+        // 1.2% gross → ~1.08% net: crosses the alert threshold. Hysteresis
+        // would demand peak+0.5% (=1.18%) and cooldown is still running —
+        // the upgrade pushes anyway.
+        let e2 = engine
+            .on_instrument(&snapshot(dec!(100), dec!(101.2)), &NoTransferInfo, t, 2)
+            .expect("upgrade must push immediately");
+        assert_eq!(e2.level, SignalLevel::Alert);
+
+        // Oscillating around the alert threshold must not re-notify.
+        assert!(engine
+            .on_instrument(&snapshot(dec!(100), dec!(100.8)), &NoTransferInfo, t, 3)
+            .is_none());
+        assert!(
+            engine
+                .on_instrument(&snapshot(dec!(100), dec!(101.2)), &NoTransferInfo, t, 4)
+                .is_none(),
+            "already alerted this episode; only a hysteresis re-widening may re-emit"
+        );
+    }
+
+    /// A spread that opens straight above the alert threshold is `alert` from
+    /// the first signal.
+    #[test]
+    fn first_crossing_above_alert_threshold_is_alert() {
+        let engine = ScreenerEngine::new(cfg_no_transfer());
+        let e = engine
+            .on_instrument(&snapshot(dec!(100), dec!(106)), &NoTransferInfo, Instant::now(), 1)
+            .expect("emits");
+        assert_eq!(e.level, SignalLevel::Alert); // 6% >> 1%
     }
 
     /// One rejected tick is noise; only a sustained run of them closes the

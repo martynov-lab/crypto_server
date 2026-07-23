@@ -59,7 +59,14 @@ pub struct ClientConfig {
 
     // --- Spread band (the 0.6%..25% control) ---
     /// Floor on the **entry** spread (net of the two entry taker fees).
+    /// Crossing it produces an `info`-level signal: shown in the client's list
+    /// but not meant to notify.
     pub min_net_spread_pct: Decimal,
+    /// Second, higher threshold: a signal whose entry spread reaches this level
+    /// is marked `alert` — the one the client actually notifies on. The upgrade
+    /// of an open episode from `info` to `alert` is pushed immediately,
+    /// bypassing the hysteresis step and cooldown (but not the rate cap).
+    pub alert_net_spread_pct: Decimal,
     /// Caps ghost spreads (delisted/frozen/wrong-token) that masquerade as huge edges.
     pub max_net_spread_pct: Decimal,
     /// Quote size (USDT) the executable VWAP spread is measured against.
@@ -124,6 +131,11 @@ pub struct ClientConfig {
     pub min_dynamics_samples: u32,
 
     // --- Chart (watch stream) ---
+    /// Longest long-history window (ms) this client wants back from
+    /// `/spread/range`. Requests are additionally capped by the server's
+    /// retention (`chart.history_window_ms`, default 3 days) — the server
+    /// cannot return more than it retains, so this only ever tightens.
+    pub history_window_ms: u64,
     /// Per-client anomaly cutoff for the live spread chart: watch backfill and
     /// ticks with `|net_pct|` above this are dropped before delivery to this
     /// client (a wrong-token / stale-quote spike is a data error, not a signal).
@@ -154,6 +166,7 @@ impl Default for ClientConfig {
             max_24h_quote_volume: None,
             min_open_interest: None,
             min_net_spread_pct: dec_lit("0.006"),
+            alert_net_spread_pct: dec_lit("0.01"),
             max_net_spread_pct: dec_lit("0.25"),
             target_notional_q: dec_lit("2000"),
             min_executable_notional: dec_lit("500"),
@@ -179,6 +192,7 @@ impl Default for ClientConfig {
             max_spread_duration_ms: 300_000,
             min_dynamics_samples: 20,
             max_chart_spread_pct: dec_lit("0.50"),
+            history_window_ms: 259_200_000, // 3 days
             hysteresis_step_pct: dec_lit("0.005"),
             episode_close_ticks: 3,
             min_signal_lifetime_ms: 1500,
@@ -237,6 +251,9 @@ impl ClientConfig {
         }
         if self.max_net_spread_pct < self.min_net_spread_pct {
             return Err("max_net_spread_pct must be >= min_net_spread_pct".into());
+        }
+        if self.alert_net_spread_pct < self.min_net_spread_pct {
+            return Err("alert_net_spread_pct must be >= min_net_spread_pct".into());
         }
         if self.target_notional_q <= Decimal::ZERO {
             return Err("target_notional_q must be > 0".into());

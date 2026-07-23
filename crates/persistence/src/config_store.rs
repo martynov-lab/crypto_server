@@ -116,6 +116,7 @@ mod tests {
         let store = ConfigStore::load_or(path.clone(), ClientConfig::default());
         let mut cfg = ClientConfig::default();
         cfg.min_net_spread_pct = dec!(0.042);
+        cfg.alert_net_spread_pct = dec!(0.05); // must stay >= the entry floor
         store.set(cfg).expect("valid config");
 
         // A fresh store (server restart) must come back with the client's

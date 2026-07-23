@@ -55,6 +55,12 @@ jitter_ms = 400
 resolution_ms = 1000
 window_ms = 1800000     # 30 min ring buffer retained per instrument
 max_watches = 3         # max concurrent chart streams per WS session
+# Long history (GET /spread/range): coarse best-pair aggregates (min/max/close
+# net spread per bucket). In-memory only — accumulates from server start and is
+# lost on restart. Memory ≈ 72 B x (window/resolution) per instrument
+# (~300 KB per coin for 3 days of 1-minute buckets).
+history_window_ms = 259200000   # 3 days
+history_resolution_ms = 60000   # 1-minute buckets
 # Global anomaly cutoff: samples with |net_pct| above this are dropped from the
 # shared tape AND the dynamics history (wrong-token / stale-quote data errors).
 # Set well above the legit alert band; clients can tighten via max_chart_spread_pct.
@@ -92,6 +98,10 @@ min_open_interest = "0"      # base units; 0 => disabled
 # NOTE: this bounds the *entry* only. Profitability is gated by
 # min_round_trip_pct below, which also charges the unwind and the funding carry.
 min_net_spread_pct = "0.006"
+# Second threshold: crossing min_net_spread_pct emits an `info` signal (list
+# it, don't notify); reaching this level marks the signal `alert` (notify).
+# The info→alert upgrade is pushed immediately, past cooldown/hysteresis.
+alert_net_spread_pct = "0.01"
 max_net_spread_pct = "0.25"
 target_notional_q = "2000"   # USDT size the executable VWAP spread is measured against
 min_executable_notional = "500"
@@ -135,6 +145,7 @@ spike_bypass_round_trip_mult = "2"
 max_spread_duration_ms = 300000   # reject spreads that stay wide > 5 min (trap)
 min_dynamics_samples = 20         # warmup before dynamics filters apply
 max_chart_spread_pct = "0.50"     # client-side chart anomaly cutoff (drops |net| above this from the watch stream)
+history_window_ms = 259200000     # longest /spread/range window this client asks for (capped by server retention)
 
 # Noise control.
 hysteresis_step_pct = "0.005"     # re-alert only when spread widens 0.5% past prior peak

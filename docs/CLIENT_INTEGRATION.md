@@ -31,6 +31,7 @@ endpoints. Everything here is derived from the running server
 | Current best spread per instrument | GET | `/summary` |
 | Traded-instrument catalog (coins × venues) | GET | `/instruments` |
 | Spread chart history (fallback) | GET | `/spread/history?base=…&quote=…&window_ms=…` |
+| Long spread history, days (minute buckets) | GET | `/spread/range?base=…&quote=…&window_ms=…` |
 | Current (persisted) screening config | GET | `/config` |
 | Why is there no signal for a coin | GET | `/why?base=…&quote=…` |
 | Validate a config without subscribing | POST | `/config/validate` |
@@ -104,6 +105,7 @@ non-duplicate signal appears for a screened instrument:
 ```json
 {
   "type": "event",
+  "level": "alert",
   "spread": {
     "instrument": { "base": "ARB", "quote": "USDT", "kind": "perp" },
     "buy_exchange": "mexc",
@@ -143,6 +145,21 @@ non-duplicate signal appears for a screened instrument:
 `funding`, `dynamics`, and `quality_score` are **omitted** when unavailable.
 `buy_exchange` is where you buy (lowest ask); `sell_exchange` is where you sell
 (highest bid).
+
+**Signal levels — display vs notify.** Two thresholds drive `level`:
+
+- `"info"` — the entry spread crossed `min_net_spread_pct` (default 0.6%). Add
+  the signal to the list; do **not** notify.
+- `"alert"` — the entry spread reached `alert_net_spread_pct` (default 1%,
+  client-configurable). Mark it prominently and fire the notification on this
+  level only.
+
+When an open episode upgrades from `info` to `alert`, the server pushes that
+event **immediately**, bypassing the hysteresis step and the cooldown — the
+client gets exactly one upgrade push per episode, so oscillation around the
+alert threshold cannot re-notify. A spread that opens straight above
+`alert_net_spread_pct` is `"alert"` from its first event. Further re-alerts of
+either level follow the normal hysteresis rules (`hysteresis_step_pct`).
 
 **Which number is the profit.** A cross-exchange futures arb is two round trips
 of taker orders — open both legs, then close both legs — so the entry spread
@@ -297,6 +314,54 @@ returns `{ instrument, resolution_ms, window_ms, long_exchange, short_exchange, 
 (same In/Out point shape) for a cold render without an open socket. Omit the pair
 params to let the server pick the best pair.
 
+### 2.46 Long spread history (`GET /spread/range`)
+
+The fine per-venue tape behind `watch`/`/spread/history` only holds minutes
+(default 30). To answer *"what spread is this coin even capable of"*, the server
+also keeps a **coarse tier**: per instrument, the best-pair net spread is folded
+into fixed buckets (default 1 minute) retained for days (default 3):
+
+```text
+GET /spread/range?base=ARB&quote=USDT&window_ms=259200000
+```
+
+```json
+{
+  "instrument": { "base": "ARB", "quote": "USDT", "kind": "perp" },
+  "resolution_ms": 60000,
+  "window_ms": 259200000,
+  "buckets": [
+    { "ts_ms": 1752230400000, "min_net_pct": "0.0008", "max_net_pct": "0.0121",
+      "close_net_pct": "0.0031", "buy_exchange": "mexc", "sell_exchange": "kucoin",
+      "samples": 60 }
+  ]
+}
+```
+
+`min`/`max`/`close` are the extremes and last value of the best net spread
+inside the bucket; `buy/sell_exchange` are the pair at the bucket's **maximum**.
+Omitting `window_ms` returns the client config's `history_window_ms`.
+
+**Limitations — read before relying on it:**
+
+- **In-memory only.** History accumulates from server start and is lost on
+  restart; after a restart the 3-day view refills over 3 days. Durable storage
+  is a later phase.
+- **Best-pair aggregates only.** The coarse tier stores the best pairing's net
+  spread — per-venue books are not retained, so In/Out lines for a *fixed* pair
+  and funding history exist only inside the fine window (`/spread/history`,
+  default 30 min).
+- **Resolution is the server's** (`chart.history_resolution_ms`, default 1 min);
+  intra-minute spikes shorter than the sampling cadence (1s) are invisible, and
+  within a bucket only min/max/close survive.
+- **Retention is a server resource**: ~72 bytes × buckets per instrument
+  (~300 KB per coin for 3 days at 1 min; a few hundred screened coins ≈
+  ~100+ MB). Raising `chart.history_window_ms` grows RAM linearly.
+- Buckets inherit the global anomaly cap — data-error spikes above
+  `chart.sanity_max_spread_pct` never enter the history.
+- `samples` below the expected count (60 for 1-min buckets at 1s sampling)
+  means gaps: fewer than two live venues, or server downtime.
+
 ### 2.5 Reconnect
 
 On socket close, reconnect with exponential backoff + jitter and re-send
@@ -319,7 +384,8 @@ should render the newest event per instrument and not assume every tick arrives.
 | `min_24h_quote_volume` | decimal-str | `"100000"` | 24h volume floor (USDT) |
 | `max_24h_quote_volume` | decimal-str? | `null` | 24h volume ceiling (USDT); `null` = off. Set (e.g. `"200000"`) to hunt only low-caps |
 | `min_open_interest` | decimal-str? | `null` | OI floor (not yet enforced) |
-| `min_net_spread_pct` | decimal-str | `"0.006"` | Lower band = 0.6% |
+| `min_net_spread_pct` | decimal-str | `"0.006"` | Lower band = 0.6%; crossing it emits an `info` signal (display-only) |
+| `alert_net_spread_pct` | decimal-str | `"0.01"` | `alert` threshold (notify); must be ≥ `min_net_spread_pct`. The info→alert upgrade pushes immediately |
 | `max_net_spread_pct` | decimal-str | `"0.25"` | Upper band = 25% (ghost cap) |
 | `target_notional_q` | decimal-str | `"2000"` | USDT size the VWAP spread is measured at |
 | `min_executable_notional` | decimal-str | `"500"` | Required real depth on both legs |
@@ -344,6 +410,7 @@ should render the newest event per instrument and not assume every tick arrives.
 | `max_chart_spread_pct` | decimal-str | `"0.50"` | Chart anomaly cutoff: watch backfill/ticks whose abs(net_pct) exceeds this are dropped for this client (wrong-token / stale-quote data errors) |
 | `hysteresis_step_pct` | decimal-str | `"0.005"` | Re-alert only if spread widens this much |
 | `episode_close_ticks` | int | `3` | Consecutive rejects before an episode closes and hysteresis re-arms |
+| `history_window_ms` | int | `259200000` (3 d) | Longest `/spread/range` window returned to this client; capped by server retention `chart.history_window_ms` |
 | `min_signal_lifetime_ms` | int | `1500` | Suppress until opportunity persists this long |
 | `cooldown_ms` | int | `2000` | Min gap between emits per instrument |
 | `max_signals_per_min` | int? | `120` | Global per-session rate cap |

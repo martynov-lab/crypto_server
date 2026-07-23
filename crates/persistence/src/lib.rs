@@ -28,7 +28,7 @@ impl CsvSink {
         if is_new {
             writeln!(
                 w,
-                "ts_ms,instrument,buy_exchange,sell_exchange,gross_pct,net_pct,out_pct,round_trip_pct,funding_cost_pct,expected_profit_quote,leg_skew_ms,executable_notional,capped_by_depth,funding_diff_apr"
+                "ts_ms,level,instrument,buy_exchange,sell_exchange,gross_pct,net_pct,out_pct,round_trip_pct,funding_cost_pct,expected_profit_quote,leg_skew_ms,executable_notional,capped_by_depth,funding_diff_apr"
             )?;
             w.flush()?;
         }
@@ -46,8 +46,12 @@ impl CsvSink {
             .unwrap_or_default();
         let s = &ev.spread;
         let line = format!(
-            "{},{}/{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{}/{},{},{},{},{},{},{},{},{},{},{},{},{}",
             ev.ts_ms,
+            match ev.level {
+                screener::SignalLevel::Alert => "alert",
+                screener::SignalLevel::Info => "info",
+            },
             s.instrument.base,
             s.instrument.quote,
             s.buy_exchange,

@@ -23,7 +23,8 @@
       "Bash(git config *)",
       "Bash(grep -n \"ws://\\\\|wss://\\\\|localhost\\\\|8080\\\\|token\" docs/CLIENT_INTEGRATION.md)",
       "Bash(sed -n '/fn summary_row_respects_volume_band/,/^    }/p' crates/screener/src/rules.rs)",
-      "Bash(sed -n '/fn cfg\\(\\) -> ClientConfig/,/^    }/p' crates/screener/src/rules.rs)"
+      "Bash(sed -n '/fn cfg\\(\\) -> ClientConfig/,/^    }/p' crates/screener/src/rules.rs)",
+      "Bash(grep -n \"### \\\\`max_chart_spread_pct\\\\`\" -A 6 docs/CLIENT_SETTINGS_REFERENCE.md)"
     ]
   }
 }

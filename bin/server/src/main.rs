@@ -140,10 +140,12 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(settings.ingest.quiet_book_max_ms),
         dynamics_cfg,
     ));
-    let tape = Arc::new(spread_tape::SpreadTape::new(
+    let tape = Arc::new(spread_tape::SpreadTape::with_history(
         Duration::from_millis(settings.chart.window_ms),
         Duration::from_millis(settings.chart.resolution_ms),
         128,
+        Duration::from_millis(settings.chart.history_window_ms),
+        Duration::from_millis(settings.chart.history_resolution_ms),
     ));
     let store = Arc::new(TransferStore::new());
     let (events_tx, _events_rx) = broadcast::channel::<Instrument>(1024);
@@ -268,6 +270,9 @@ async fn main() -> anyhow::Result<()> {
                             {
                                 if point.net_pct.abs() <= sanity_cap {
                                     market.record_spread(&instrument, point.net_pct, now);
+                                    // Long-history tier: minute aggregates for
+                                    // the multi-day "what does this coin do".
+                                    tape.record_point(&instrument, &point);
                                 } else {
                                     metrics::counter!("spread_anomalies_dropped_total").increment(1);
                                 }
@@ -429,10 +434,14 @@ fn auth_policy() -> AuthPolicy {
 /// entry spread is shown next to it so the two are never confused.
 fn log_signal(ev: &screener::ScreenerEvent) {
     let s = &ev.spread;
+    let level = match ev.level {
+        screener::SignalLevel::Alert => "ALERT",
+        screener::SignalLevel::Info => "info",
+    };
     // buy_exchange = lowest ask → the long leg; sell_exchange = highest bid → short.
     info!(
         target: "signal!!!!!",
-        "{}: лонг {} на {}, шорт {} на {} — вход {}%, за круг {}% (~{} USDT на {})",
+        "[{level}] {}: лонг {} на {}, шорт {} на {} — вход {}%, за круг {}% (~{} USDT на {})",
         s.instrument.base,
         venue_symbol(s.buy_exchange, &s.instrument),
         venue_name(s.buy_exchange),

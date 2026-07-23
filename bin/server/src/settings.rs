@@ -30,6 +30,12 @@ pub struct ChartCfg {
     /// history (protects every client's chart + baseline/z-score). Set well
     /// above the legit alert band (e.g. 0.50 = 50%).
     pub sanity_max_spread_pct: Decimal,
+    /// Long-history retention (server resource bound): how far back the coarse
+    /// best-pair spread aggregates go. Memory ≈ 72 bytes × (window/resolution)
+    /// per instrument (~300 KB per coin for 3 days of 1-minute buckets).
+    pub history_window_ms: u64,
+    /// Bucket size of the long history.
+    pub history_resolution_ms: u64,
 }
 
 impl Default for ChartCfg {
@@ -39,6 +45,8 @@ impl Default for ChartCfg {
             window_ms: 1_800_000, // 30 min
             max_watches: 3,
             sanity_max_spread_pct: Decimal::new(50, 2), // 0.50
+            history_window_ms: 259_200_000, // 3 days
+            history_resolution_ms: 60_000,  // 1-minute buckets
         }
     }
 }

@@ -128,6 +128,26 @@ pub struct ChartPoint {
     pub funding_short_pct: Option<Decimal>,
 }
 
+/// One time bucket of the long spread history: an aggregate of the best-pair
+/// net spread over the bucket interval (default 1 minute). This is what makes
+/// multi-day history affordable — full [`VenueSample`]s at 1s resolution for
+/// 3 days would need gigabytes, minute aggregates need ~300 KB per instrument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpreadBucket {
+    /// Bucket start (epoch ms, aligned to the bucket resolution).
+    pub ts_ms: i64,
+    /// Lowest / highest best net spread seen inside the bucket.
+    pub min_net_pct: Decimal,
+    pub max_net_pct: Decimal,
+    /// Last sample of the bucket.
+    pub close_net_pct: Decimal,
+    /// The pair at the bucket's maximum — the venues that made the extreme.
+    pub buy_exchange: ExchangeId,
+    pub sell_exchange: ExchangeId,
+    /// Samples aggregated into this bucket (gaps show as small counts).
+    pub samples: u32,
+}
+
 /// Why a candidate spread was surfaced or rejected — attached to events for
 /// client-side explanation and for lifetime/analysis logging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
