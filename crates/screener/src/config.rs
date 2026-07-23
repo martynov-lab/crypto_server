@@ -31,7 +31,7 @@ impl MarketPair {
     pub const PERP_SPOT: MarketPair = MarketPair::new(MarketKind::Perp, MarketKind::Spot);
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClientConfig {
     // --- Universe / selection ---

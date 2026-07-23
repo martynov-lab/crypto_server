@@ -129,11 +129,13 @@ async fn main() -> anyhow::Result<()> {
         .context("installing prometheus recorder")?;
     let metrics_render = Arc::new(move || prom.render());
 
-    // Shared state.
+    // Shared state. The dynamics episode-open threshold is no longer part of
+    // this static config — it now tracks the live client config on every
+    // sample (see the spread-sampler loop below), so a runtime change to
+    // min_net_spread_pct takes effect immediately instead of needing a restart.
     let dynamics_cfg = market_state::dynamics::DynamicsConfig {
         window: Duration::from_secs(300),
         min_sample_interval: Duration::from_millis(500),
-        reference_threshold: settings.default_client.min_net_spread_pct,
     };
     let market = Arc::new(MarketState::with_params(
         Duration::from_millis(settings.ingest.staleness_ms),
@@ -148,6 +150,25 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(settings.chart.history_resolution_ms),
     ));
     let store = Arc::new(TransferStore::new());
+    // Optional CSV log of every emitted signal (spec §8.5). Best-effort: a
+    // failure to open it disables logging rather than failing startup.
+    let csv_sink: Option<Arc<persistence::CsvSink>> = {
+        let path = settings.persistence.csv_path.trim();
+        if path.is_empty() {
+            None
+        } else {
+            match persistence::CsvSink::open(path) {
+                Ok(sink) => {
+                    info!(%path, "signal CSV logging enabled");
+                    Some(Arc::new(sink))
+                }
+                Err(e) => {
+                    warn!(%path, error = %e, "failed to open signal CSV; logging disabled");
+                    None
+                }
+            }
+        }
+    };
     let (events_tx, _events_rx) = broadcast::channel::<Instrument>(1024);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -269,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
                                 screener::best_spread_point(&snap, &cfg, ts_ms)
                             {
                                 if point.net_pct.abs() <= sanity_cap {
-                                    market.record_spread(&instrument, point.net_pct, now);
+                                    market.record_spread(&instrument, point.net_pct, now, cfg.min_net_spread_pct);
                                     // Long-history tier: minute aggregates for
                                     // the multi-day "what does this coin do".
                                     tape.record_point(&instrument, &point);
@@ -295,16 +316,21 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Terminal signal logger: run the default screening config server-side and
-    // print each signal to the terminal, so the operator sees the same spread
-    // alerts a subscribed client would while setting the system up, before any
-    // client connects. Scans on a fixed timer (like the spread sampler) rather
-    // than chasing the high-rate market broadcast — the engine's own
-    // hysteresis/cooldown dedups across scans, and a timer can't fall behind.
-    if settings.server.log_signals {
+    // Server-side signal evaluator: run the current client config server-side
+    // and (depending on settings) print each signal to the terminal and/or
+    // append it to the CSV log, so the operator sees the same spread alerts a
+    // subscribed client would, and/or gets a durable record of them. Scans on
+    // a fixed timer (like the spread sampler) rather than chasing the
+    // high-rate market broadcast — the engine's own hysteresis/cooldown
+    // dedups across scans, and a timer can't fall behind. Runs whenever
+    // either sink is enabled — CSV logging must not require the terminal
+    // printer to also be on.
+    if settings.server.log_signals || csv_sink.is_some() {
         let market = market.clone();
         let oracle: Arc<dyn screener::TransferOracle> = store.clone();
         let cfg_store = cfg_store.clone();
+        let csv_sink = csv_sink.clone();
+        let log_signals = settings.server.log_signals;
         let mut shutdown_rx = shutdown_rx.clone();
         let scan = Duration::from_millis(settings.chart.resolution_ms.max(500));
         tokio::spawn(async move {
@@ -314,13 +340,13 @@ async fn main() -> anyhow::Result<()> {
             // by the store's generation), not on every scan.
             let (mut cfg_gen, cfg) = cfg_store.snapshot();
             let mut engine = screener::ScreenerEngine::new((*cfg).clone());
-            info!("terminal signal logger active (using the current client config)");
+            info!(log_signals, csv = csv_sink.is_some(), "signal evaluator active (using the current client config)");
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
                         let (gen, cfg) = cfg_store.snapshot();
                         if gen != cfg_gen {
-                            info!("client config changed; signal logger reconfigured");
+                            info!("client config changed; signal evaluator reconfigured");
                             engine = screener::ScreenerEngine::new((*cfg).clone());
                             cfg_gen = gen;
                         }
@@ -329,7 +355,12 @@ async fn main() -> anyhow::Result<()> {
                         for instrument in market.instruments() {
                             let snap = market.snapshot(&instrument, now);
                             if let Some(ev) = engine.on_instrument(&snap, oracle.as_ref(), now, ts_ms) {
-                                log_signal(&ev);
+                                if log_signals {
+                                    log_signal(&ev);
+                                }
+                                if let Some(sink) = &csv_sink {
+                                    sink.record(&ev);
+                                }
                             }
                         }
                     }
@@ -338,7 +369,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            info!("signal logger stopped");
+            info!("signal evaluator stopped");
         });
     }
 

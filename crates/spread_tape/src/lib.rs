@@ -171,6 +171,13 @@ impl SpreadTape {
                 cur.close_net_pct = point.net_pct;
                 cur.samples += 1;
             }
+            // A point older than the bucket already being built means the
+            // clock moved backward (e.g. an NTP correction). Folding it in
+            // would close the current bucket and open a new, OLDER one behind
+            // it — `long_history` doesn't sort, so that would corrupt the
+            // oldest-to-newest order it relies on. Simplest safe response:
+            // drop the point rather than risk a misordered history.
+            Some(cur) if bucket_ts < cur.ts_ms => {}
             _ => {
                 // Close the previous bucket (if any) and start a new one.
                 if let Some(done) = h.current.take() {
@@ -344,6 +351,31 @@ mod tests {
         let h = tape.long_history(&inst, u64::MAX / 2).unwrap();
         assert!(h.len() <= 7, "retention must be bounded, got {}", h.len());
         assert_eq!(h.last().unwrap().ts_ms, 59 * 60_000);
+    }
+
+    /// Regression: a point older than the bucket already being built (clock
+    /// moved backward) used to close the in-progress bucket and open a new one
+    /// *behind* it, breaking the oldest-to-newest order `long_history` assumes
+    /// (it filters and returns as-is, never sorts). The point must be dropped
+    /// instead of corrupting the ordering.
+    #[test]
+    fn clock_moving_backward_does_not_corrupt_bucket_order() {
+        let tape = SpreadTape::with_history(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            16,
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        );
+        let inst = Instrument::perp("XYZ", "USDT");
+        tape.record_point(&inst, &point(120_000, dec!(0.005))); // minute 2
+        // Clock jumps back into minute 0 — must not be folded in out of order.
+        tape.record_point(&inst, &point(1_000, dec!(0.009)));
+
+        let h = tape.long_history(&inst, 3_600_000).unwrap();
+        assert_eq!(h.len(), 1, "the backward point must be dropped, not appended");
+        assert_eq!(h[0].ts_ms, 120_000);
+        assert_eq!(h[0].samples, 1, "the in-progress bucket is unaffected");
     }
 
     #[test]

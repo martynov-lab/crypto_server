@@ -19,8 +19,6 @@ pub struct DynamicsConfig {
     pub window: Duration,
     /// Minimum spacing between recorded samples per instrument (throttle).
     pub min_sample_interval: Duration,
-    /// Reference threshold defining an "above-baseline episode" (for duration).
-    pub reference_threshold: Decimal,
 }
 
 impl Default for DynamicsConfig {
@@ -28,7 +26,6 @@ impl Default for DynamicsConfig {
         DynamicsConfig {
             window: Duration::from_secs(300),
             min_sample_interval: Duration::from_millis(500),
-            reference_threshold: Decimal::new(2, 2), // 0.02
         }
     }
 }
@@ -117,13 +114,20 @@ impl SpreadHistory {
 
     /// Record a representative net spread for `instrument`. Throttled by
     /// `min_sample_interval`; updates the above-threshold episode clock.
-    pub fn record(&self, instrument: &Instrument, net: Decimal, now: Instant) {
+    ///
+    /// `reference_threshold` (what counts as "above baseline" for the episode
+    /// clock) is passed in on every call, sourced from the **current** client
+    /// config, rather than stored at construction — the caller's threshold can
+    /// change at runtime (a client may retune `min_net_spread_pct` at any
+    /// time), and the episode clock has to react to that immediately rather
+    /// than staying pinned to whatever value was in effect at server startup.
+    pub fn record(&self, instrument: &Instrument, net: Decimal, now: Instant, reference_threshold: Decimal) {
         let mut s = self.series.entry(instrument.clone()).or_insert_with(Series::new);
 
         if let Some(last) = s.last_recorded {
             if now.saturating_duration_since(last) < self.cfg.min_sample_interval {
                 // Still track the episode clock even when not sampling.
-                update_episode(&mut s, net, now, self.cfg.reference_threshold);
+                update_episode(&mut s, net, now, reference_threshold);
                 return;
             }
         }
@@ -138,7 +142,7 @@ impl SpreadHistory {
                 break;
             }
         }
-        update_episode(&mut s, net, now, self.cfg.reference_threshold);
+        update_episode(&mut s, net, now, reference_threshold);
     }
 
     /// Compute stats for `instrument`, or `None` if no samples yet.
@@ -226,8 +230,14 @@ mod tests {
         DynamicsConfig {
             window: Duration::from_secs(300),
             min_sample_interval: Duration::from_millis(0),
-            reference_threshold: dec!(0.02),
         }
+    }
+
+    /// The reference threshold used by every test below (stands in for a
+    /// client's `min_net_spread_pct`, now passed per-call instead of fixed at
+    /// construction).
+    fn threshold() -> Decimal {
+        dec!(0.02)
     }
 
     #[test]
@@ -237,9 +247,9 @@ mod tests {
         let t0 = Instant::now();
         // Tight baseline near 0.3%, then a spike to 5%.
         for i in 0..20 {
-            h.record(&inst, dec!(0.003), t0 + Duration::from_millis(i));
+            h.record(&inst, dec!(0.003), t0 + Duration::from_millis(i), threshold());
         }
-        h.record(&inst, dec!(0.05), t0 + Duration::from_millis(100));
+        h.record(&inst, dec!(0.05), t0 + Duration::from_millis(100), threshold());
         let st = h.stats(&inst, t0 + Duration::from_millis(101)).unwrap();
         assert!(st.baseline_pct < dec!(0.01), "baseline should be tight");
         assert_eq!(st.current_pct, dec!(0.05));
@@ -255,11 +265,11 @@ mod tests {
         let inst = Instrument::perp("XYZ", "USDT");
         let t0 = Instant::now();
         for i in 0..40 {
-            h.record(&inst, dec!(0.003), t0 + Duration::from_millis(i));
+            h.record(&inst, dec!(0.003), t0 + Duration::from_millis(i), threshold());
         }
         // 30 consecutive ticks of a 5% spread — the episode stays open.
         for i in 0..30 {
-            h.record(&inst, dec!(0.05), t0 + Duration::from_millis(100 + i));
+            h.record(&inst, dec!(0.05), t0 + Duration::from_millis(100 + i), threshold());
         }
         let st = h.stats(&inst, t0 + Duration::from_millis(200)).unwrap();
         assert_eq!(st.baseline_pct, dec!(0.003), "baseline must ignore the episode");
@@ -273,7 +283,7 @@ mod tests {
         let inst = Instrument::perp("XYZ", "USDT");
         let t0 = Instant::now();
         for i in 0..20 {
-            h.record(&inst, dec!(0.003), t0 + Duration::from_millis(i));
+            h.record(&inst, dec!(0.003), t0 + Duration::from_millis(i), threshold());
         }
         let st = h.stats(&inst, t0 + Duration::from_millis(21)).unwrap();
         // A spread at the baseline is not an outlier; one far above it is.
@@ -288,7 +298,7 @@ mod tests {
         let inst = Instrument::perp("XYZ", "USDT");
         let t0 = Instant::now();
         for i in 0..10 {
-            h.record(&inst, dec!(0.001), t0 + Duration::from_millis(i));
+            h.record(&inst, dec!(0.001), t0 + Duration::from_millis(i), threshold());
         }
         let st = h.stats(&inst, t0 + Duration::from_millis(11)).unwrap();
         assert_eq!(st.mad_pct, dec!(0));
@@ -300,12 +310,30 @@ mod tests {
         let h = SpreadHistory::new(cfg());
         let inst = Instrument::perp("XYZ", "USDT");
         let t0 = Instant::now();
-        h.record(&inst, dec!(0.10), t0); // above threshold -> episode opens
+        h.record(&inst, dec!(0.10), t0, threshold()); // above threshold -> episode opens
         let st = h.stats(&inst, t0 + Duration::from_millis(5000)).unwrap();
         assert!(st.episode_ms >= 5000);
         // Drops below threshold -> episode resets.
-        h.record(&inst, dec!(0.001), t0 + Duration::from_millis(6000));
+        h.record(&inst, dec!(0.001), t0 + Duration::from_millis(6000), threshold());
         let st = h.stats(&inst, t0 + Duration::from_millis(6000)).unwrap();
         assert_eq!(st.episode_ms, 0);
+    }
+
+    /// Regression: the episode threshold used to be fixed at construction
+    /// (mirroring the TOML bootstrap value) and never tracked later changes to
+    /// a client's `min_net_spread_pct`. Passing it per-call means a threshold
+    /// change takes effect on the very next sample.
+    #[test]
+    fn threshold_change_takes_effect_immediately() {
+        let h = SpreadHistory::new(cfg());
+        let inst = Instrument::perp("XYZ", "USDT");
+        let t0 = Instant::now();
+        // 1.5% is below a 2% threshold: no episode.
+        h.record(&inst, dec!(0.015), t0, dec!(0.02));
+        assert_eq!(h.stats(&inst, t0).unwrap().episode_ms, 0);
+        // The very next sample, under a tightened 1% threshold, opens one.
+        h.record(&inst, dec!(0.015), t0 + Duration::from_millis(1), dec!(0.01));
+        let st = h.stats(&inst, t0 + Duration::from_millis(501)).unwrap();
+        assert!(st.episode_ms >= 500, "the new threshold applied immediately");
     }
 }

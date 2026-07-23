@@ -12,6 +12,8 @@ pub struct Settings {
     pub transfer: TransferCfg,
     #[serde(default)]
     pub chart: ChartCfg,
+    #[serde(default)]
+    pub persistence: PersistenceCfg,
     pub default_client: ClientConfig,
 }
 
@@ -133,6 +135,15 @@ pub struct TransferCfg {
     pub enabled: bool,
     pub poll_interval_secs: u64,
     pub assets: Vec<String>,
+}
+
+/// Optional CSV log of every emitted signal (spec §8.5 — track whether signals
+/// actually stay tradeable after the fact).
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistenceCfg {
+    /// Path to append signals to. Empty (the default) disables logging.
+    pub csv_path: String,
 }
 
 impl Settings {

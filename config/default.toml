@@ -73,6 +73,11 @@ poll_interval_secs = 300
 # Assets whose transfer status we track (settlement asset for perp margin rebalance).
 assets = ["USDT"]
 
+[persistence]
+# Optional CSV log of every emitted signal, appended to as they fire — lets you
+# later check whether a signal actually stayed tradeable. Empty = disabled.
+csv_path = ""
+
 # ---------------------------------------------------------------------------
 # Default client config — used for the built-in "default client" and as the
 # server-side default for WS subscribers that omit fields.

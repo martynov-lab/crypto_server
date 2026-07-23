@@ -177,8 +177,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         continue;
                                     }
                                 };
-                                debug!("client reconfigured (watches preserved)");
-                                engine = ScreenerEngine::new(newcfg.clone());
+                                // Rebuilding the engine wipes every instrument's
+                                // hysteresis/alert-level state. A client that
+                                // resubscribes as a keepalive/reconnect-recovery
+                                // habit — sending the *same* config it already
+                                // has — must not pay for that by losing track of
+                                // episodes already promoted to `alert`, which
+                                // would force them to re-earn the upgrade push.
+                                if newcfg != *engine.config() {
+                                    debug!("client reconfigured (watches preserved)");
+                                    engine = ScreenerEngine::new(newcfg.clone());
+                                } else {
+                                    debug!("resubscribed with an unchanged config; hysteresis state kept");
+                                }
                                 let _ = emit(&out_tx, Outbound::Server(ServerMessage::Subscribed { config: Box::new(newcfg) })).await;
                             }
                             Ok(ClientMessage::Watch { instrument, window_ms, resolution_ms: _, long_exchange, short_exchange }) => {

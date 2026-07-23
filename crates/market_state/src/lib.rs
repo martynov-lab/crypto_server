@@ -66,8 +66,18 @@ impl MarketState {
 
     /// Record a representative net spread sample for an instrument (called by
     /// the drain loop) to feed the rolling dynamics statistics.
-    pub fn record_spread(&self, instrument: &Instrument, net: Decimal, now: Instant) {
-        self.history.record(instrument, net, now);
+    ///
+    /// `reference_threshold` should be the caller's **current** client config
+    /// (`min_net_spread_pct`) — read fresh on every call so a runtime config
+    /// change is reflected on the next sample rather than needing a restart.
+    pub fn record_spread(
+        &self,
+        instrument: &Instrument,
+        net: Decimal,
+        now: Instant,
+        reference_threshold: Decimal,
+    ) {
+        self.history.record(instrument, net, now, reference_threshold);
     }
 
     pub fn staleness(&self) -> Duration {
@@ -149,10 +159,17 @@ impl MarketState {
             } else {
                 age > self.staleness
             };
-            // Observation age for leg-skew: an unchanged book on a live
-            // connection is "as of now"; otherwise it is as old as its receipt.
-            let as_of_age_ms = if alive && !stale {
-                0
+            // Observation age for leg-skew. A live connection makes an
+            // unchanged book usable, but its age is capped at `staleness`,
+            // **not zeroed** — zeroing made a book quiet for 25s on a live
+            // connection look exactly as fresh as one that just ticked,
+            // hiding real skew whenever it was paired with an actively
+            // trading leg on another venue (the "spread that never existed"
+            // case leg-skew exists to catch). Two quiet legs still cap to the
+            // same value and read as simultaneous; a fresh leg against a
+            // quiet one now shows a real, checkable gap.
+            let as_of_age_ms = if alive {
+                age.min(self.staleness).as_millis() as u64
             } else {
                 age.as_millis() as u64
             };
@@ -254,7 +271,11 @@ mod tests {
         );
         let q = &state.snapshot(&inst, t1).quotes[0];
         assert!(!q.stale, "unchanged book on a live connection is current");
-        assert_eq!(q.as_of_age_ms, 0, "and counts as observed now");
+        assert_eq!(
+            q.as_of_age_ms,
+            staleness.as_millis() as u64,
+            "usable, but its age is capped at staleness — not zeroed"
+        );
 
         // Connection silent for longer than staleness → the book's own age rules.
         let t2 = t1 + Duration::from_secs(5); // last_msg now 6s ago, book 15s old
@@ -276,5 +297,53 @@ mod tests {
         );
         let q = &state.snapshot(&inst, t3).quotes[0];
         assert!(q.stale, "quiet_book_max caps live-connection freshness");
+    }
+
+    /// Regression: a book quiet for ~20s on a live connection used to report
+    /// `as_of_age_ms = 0` — the same as a book that ticked 0ms ago. Paired with
+    /// an actively-trading leg on another venue, that hid a real ~20s gap
+    /// between the two observations, defeating the leg-skew check exactly in
+    /// the case it exists for: a fresh price compared against a stale one.
+    #[test]
+    fn quiet_leg_is_not_reported_as_simultaneous_with_a_fresh_one() {
+        let inst = Instrument::perp("XYZ", "USDT");
+        let staleness = Duration::from_secs(3);
+        let state = MarketState::with_params(
+            staleness,
+            Duration::from_secs(30),
+            DynamicsConfig::default(),
+        );
+        let t0 = Instant::now();
+
+        // Bybit ticks once, then goes quiet for 20s (connection stays alive
+        // via unrelated traffic).
+        apply_book(&state, ExchangeId::Bybit, &inst, t0);
+        let now = t0 + Duration::from_secs(20);
+        state.apply_at(
+            MarketUpdate::Ticker {
+                exchange: ExchangeId::Bybit,
+                instrument: Instrument::perp("OTHER", "USDT"),
+                quote_volume_24h: None,
+                open_interest: None,
+            },
+            now,
+        );
+        // Gate ticks right now — a genuinely fresh, actively-trading book.
+        apply_book(&state, ExchangeId::Gate, &inst, now);
+
+        let snap = state.snapshot(&inst, now);
+        let bybit = snap.quotes.iter().find(|q| q.exchange == ExchangeId::Bybit).unwrap();
+        let gate = snap.quotes.iter().find(|q| q.exchange == ExchangeId::Gate).unwrap();
+
+        assert!(!bybit.stale, "quiet-but-alive book is still usable");
+        assert_eq!(gate.as_of_age_ms, 0, "just-updated book is exactly current");
+        assert_eq!(
+            bybit.as_of_age_ms,
+            staleness.as_millis() as u64,
+            "quiet leg is capped at staleness, not zeroed"
+        );
+        // The real gap between them must stay visible to the leg-skew check
+        // (default max_leg_skew_ms is 750ms).
+        assert!(bybit.as_of_age_ms.abs_diff(gate.as_of_age_ms) > 750);
     }
 }

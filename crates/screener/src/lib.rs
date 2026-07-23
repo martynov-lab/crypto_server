@@ -211,8 +211,18 @@ impl ScreenerEngine {
             self.cfg.min_net_spread_pct,
             self.cfg.hysteresis_step_pct,
         );
-        if decision != Decision::Emit && !upgrade {
-            return None;
+        if decision != Decision::Emit {
+            if !upgrade {
+                return None;
+            }
+            // The upgrade bypasses hysteresis, but `decide()` only raises the
+            // peak on its `Emit` branch — its `Suppress` branch (taken here)
+            // leaves the peak wherever it was *before* this tick. Without this,
+            // the next widening would be judged against that stale, lower peak
+            // and could re-emit sooner than `hysteresis_step_pct` allows. Force
+            // the peak up to what we are about to report.
+            let net = eval.spread.net_pct;
+            st.peak.peak = Some(st.peak.peak.map_or(net, |p| p.max(net)));
         }
 
         // Global per-minute rate cap. Restore the peak when it denies the emit,
@@ -419,6 +429,44 @@ mod tests {
                 .on_instrument(&snapshot(dec!(100), dec!(101.2)), &NoTransferInfo, t, 4)
                 .is_none(),
             "already alerted this episode; only a hysteresis re-widening may re-emit"
+        );
+    }
+
+    /// Regression: the info→alert upgrade bypasses `PeakState::decide()`'s
+    /// normal Emit path, so the peak used to stay wherever it was before the
+    /// upgrade. The next widening was then judged against that stale, lower
+    /// peak — re-emitting sooner than `hysteresis_step_pct` actually allows.
+    #[test]
+    fn upgrade_still_raises_the_peak_for_future_hysteresis() {
+        let mut c = cfg_no_transfer();
+        c.min_net_spread_pct = dec!(0.006);
+        c.alert_net_spread_pct = dec!(0.01);
+        c.hysteresis_step_pct = dec!(0.005);
+        let engine = ScreenerEngine::new(c);
+        let t = Instant::now();
+
+        // net ~0.7%: info crossing, peak becomes 0.007.
+        let e1 = engine
+            .on_instrument(&snapshot(dec!(100), dec!(100.82)), &NoTransferInfo, t, 1)
+            .expect("info crossing");
+        assert_eq!(e1.level, SignalLevel::Info);
+
+        // net ~1.1%: crosses alert. Against the pre-upgrade peak (0.007) this
+        // is only +0.4pp, under the 0.5pp step — decide() alone would
+        // suppress it, but the upgrade must push anyway.
+        let e2 = engine
+            .on_instrument(&snapshot(dec!(100), dec!(101.22)), &NoTransferInfo, t, 2)
+            .expect("upgrade pushes regardless of the hysteresis step");
+        assert_eq!(e2.level, SignalLevel::Alert);
+
+        // net ~1.25%: only +0.15pp past the reported alert. If the peak had
+        // stayed stale at 0.007, 0.007+0.005=0.012 < 0.0125 would wrongly
+        // re-emit. The peak must have followed the alert to 0.011, so
+        // 0.011+0.005=0.016 correctly suppresses this.
+        let e3 = engine.on_instrument(&snapshot(dec!(100), dec!(101.37)), &NoTransferInfo, t, 3);
+        assert!(
+            e3.is_none(),
+            "must not re-emit for a widening smaller than hysteresis_step_pct past the reported alert"
         );
     }
 
